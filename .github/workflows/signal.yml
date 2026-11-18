@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  telegram-test:
+  market-data-test:
     runs-on: ubuntu-latest
 
     steps:
@@ -25,3 +25,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python signal_engine.py
+
+      - name: Test market data
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python market_data_test.py

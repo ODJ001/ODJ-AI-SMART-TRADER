@@ -9,16 +9,17 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
-INTERVALS = {"H1": "1h", "M15": "15min"}
-OUTPUTSIZE = 100
+TIMEFRAMES = {"H1": "1h", "M15": "15min"}
+OUTPUTSIZE = 120
 RR = 2.0
-MIN_SCORE = 70
+MIN_ENTRY_SCORE = 75
+
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 
-def api_candles(symbol, interval):
+def fetch_candles(symbol, interval):
     if not API_KEY:
-        raise RuntimeError("Missing TWELVE_DATA_API_KEY secret")
+        raise RuntimeError("Missing Twelve Data API key")
 
     response = requests.get(
         BASE_URL,
@@ -32,15 +33,14 @@ def api_candles(symbol, interval):
         timeout=25,
     )
     response.raise_for_status()
-    payload = response.json()
+    data = response.json()
 
-    if "values" not in payload:
-        raise RuntimeError(payload.get("message", str(payload)))
+    if "values" not in data:
+        raise RuntimeError(data.get("message", str(data)))
 
-    rows = list(reversed(payload["values"]))
     candles = []
 
-    for row in rows:
+    for row in reversed(data["values"]):
         candles.append({
             "datetime": row.get("datetime"),
             "open": float(row["open"]),
@@ -49,26 +49,28 @@ def api_candles(symbol, interval):
             "close": float(row["close"]),
         })
 
-    if len(candles) < 30:
-        raise RuntimeError(f"Only {len(candles)} candles returned")
+    if len(candles) < 40:
+        raise RuntimeError(f"Insufficient candle data: {len(candles)}")
 
     return candles
 
 
-def atr(candles, period=14):
-    trs = []
+def calculate_atr(candles, period=14):
+    true_ranges = []
 
     for i in range(1, len(candles)):
         current = candles[i]
         previous = candles[i - 1]
 
-        trs.append(max(
+        true_ranges.append(max(
             current["high"] - current["low"],
             abs(current["high"] - previous["close"]),
             abs(current["low"] - previous["close"]),
         ))
 
-    return sum(trs[-period:]) / min(period, len(trs)) if trs else 0.0
+    recent = true_ranges[-period:]
+
+    return sum(recent) / len(recent) if recent else 0.0
 
 
 def find_swings(candles, left=2, right=2):
@@ -80,179 +82,266 @@ def find_swings(candles, left=2, right=2):
 
         if all(
             high > candles[j]["high"]
-            for j in range(i-left, i+right+1) if j != i
+            for j in range(i-left, i+right+1)
+            if j != i
         ):
             highs.append({"index": i, "price": high})
 
         if all(
             low < candles[j]["low"]
-            for j in range(i-left, i+right+1) if j != i
+            for j in range(i-left, i+right+1)
+            if j != i
         ):
             lows.append({"index": i, "price": low})
 
     return highs, lows
 
 
+def direction_from_swings(highs, lows):
+    if len(highs) < 2 or len(lows) < 2:
+        return "RANGING"
+
+    higher_high = highs[-1]["price"] > highs[-2]["price"]
+    higher_low = lows[-1]["price"] > lows[-2]["price"]
+
+    lower_high = highs[-1]["price"] < highs[-2]["price"]
+    lower_low = lows[-1]["price"] < lows[-2]["price"]
+
+    if higher_high and higher_low:
+        return "BULLISH"
+
+    if lower_high and lower_low:
+        return "BEARISH"
+
+    return "RANGING"
+
+
 def analyse_structure(candles):
     highs, lows = find_swings(candles)
 
-    if len(highs) < 2 or len(lows) < 2:
-        return {
-            "direction": "RANGING",
-            "bos": "NONE",
-            "choch": "NONE",
-            "event": "NONE",
-            "swing_high": None,
-            "swing_low": None,
-            "highs": highs,
-            "lows": lows,
-        }
+    current_direction = direction_from_swings(highs, lows)
 
-    h1, h2 = highs[-2]["price"], highs[-1]["price"]
-    l1, l2 = lows[-2]["price"], lows[-1]["price"]
-
-    if h2 > h1 and l2 > l1:
-        direction = "BULLISH"
-    elif h2 < h1 and l2 < l1:
-        direction = "BEARISH"
-    else:
-        direction = "RANGING"
-
-    event = "NONE"
-    event_level = None
-    event_index = None
-
-    recent_start = max(2, len(candles) - 14)
-
-    for i in range(recent_start, len(candles)):
-        previous_close = candles[i-1]["close"]
-        close = candles[i]["close"]
-
-        eligible_highs = [x for x in highs if x["index"] < i]
-        eligible_lows = [x for x in lows if x["index"] < i]
-
-        if eligible_highs:
-            level = eligible_highs[-1]["price"]
-
-            if previous_close <= level and close > level:
-                event = "BULLISH"
-                event_level = level
-                event_index = i
-
-        if eligible_lows:
-            level = eligible_lows[-1]["price"]
-
-            if previous_close >= level and close < level:
-                event = "BEARISH"
-                event_level = level
-                event_index = i
-
-    bos = "NONE"
-    choch = "NONE"
-
-    if event != "NONE":
-        if direction == event:
-            bos = event
-        else:
-            choch = event
-
-    return {
-        "direction": direction,
-        "bos": bos,
-        "choch": choch,
-        "event": event,
-        "event_level": event_level,
-        "event_index": event_index,
-        "swing_high": highs[-1]["price"],
-        "swing_low": lows[-1]["price"],
+    result = {
+        "direction": current_direction,
+        "bos": "NONE",
+        "choch": "NONE",
+        "range_break": "NONE",
+        "event": "NONE",
+        "event_index": None,
+        "event_level": None,
+        "swing_high": highs[-1]["price"] if highs else None,
+        "swing_low": lows[-1]["price"] if lows else None,
         "highs": highs,
         "lows": lows,
     }
 
+    # Only inspect recent breaks of confirmed swing levels.
+    start = max(3, len(candles) - 14)
 
-def find_zones(candles, structure):
+    for i in range(start, len(candles)):
+        previous_close = candles[i - 1]["close"]
+        current_close = candles[i]["close"]
+
+        previous_highs = [x for x in highs if x["index"] < i]
+        previous_lows = [x for x in lows if x["index"] < i]
+
+        broken_side = None
+        broken_level = None
+
+        if previous_highs:
+            level = previous_highs[-1]["price"]
+
+            if previous_close <= level and current_close > level:
+                broken_side = "BULLISH"
+                broken_level = level
+
+        if previous_lows:
+            level = previous_lows[-1]["price"]
+
+            if previous_close >= level and current_close < level:
+                broken_side = "BEARISH"
+                broken_level = level
+
+        if broken_side is None:
+            continue
+
+        # Determine market direction immediately before the break.
+        prior_highs = [x for x in highs if x["index"] < i - 2]
+        prior_lows = [x for x in lows if x["index"] < i - 2]
+        prior_direction = direction_from_swings(prior_highs, prior_lows)
+
+        result["event"] = broken_side
+        result["event_index"] = i
+        result["event_level"] = broken_level
+        result["bos"] = "NONE"
+        result["choch"] = "NONE"
+        result["range_break"] = "NONE"
+
+        if prior_direction == broken_side:
+            result["bos"] = broken_side
+        elif prior_direction in ("BULLISH", "BEARISH"):
+            result["choch"] = broken_side
+        else:
+            result["range_break"] = broken_side
+
+    return result
+
+
+def cluster_levels(levels, tolerance):
+    if not levels:
+        return []
+
+    sorted_levels = sorted(levels)
+    clusters = []
+
+    for price in sorted_levels:
+        if not clusters:
+            clusters.append([price])
+            continue
+
+        average = sum(clusters[-1]) / len(clusters[-1])
+
+        if abs(price - average) <= tolerance:
+            clusters[-1].append(price)
+        else:
+            clusters.append([price])
+
+    output = []
+
+    for cluster in clusters:
+        if len(cluster) >= 2:
+            output.append({
+                "level": sum(cluster) / len(cluster),
+                "touches": len(cluster),
+                "low": min(cluster),
+                "high": max(cluster),
+            })
+
+    return output
+
+
+def find_liquidity(candles):
+    highs, lows = find_swings(candles)
+    volatility = calculate_atr(candles)
+    price = candles[-1]["close"]
+
+    tolerance = max(volatility * 0.12, price * 0.00005)
+
+    buy_levels = cluster_levels(
+        [x["price"] for x in highs],
+        tolerance,
+    )
+
+    sell_levels = cluster_levels(
+        [x["price"] for x in lows],
+        tolerance,
+    )
+
+    buy_levels.sort(key=lambda x: abs(x["level"] - price))
+    sell_levels.sort(key=lambda x: abs(x["level"] - price))
+
+    return buy_levels[:3], sell_levels[:3]
+
+
+def detect_zones(candles, structure):
     zones = []
-    current = len(candles) - 1
-    event_i = structure.get("event_index")
-    event = structure.get("event")
-    volatility = atr(candles)
+    current_index = len(candles) - 1
+    volatility = calculate_atr(candles)
 
     # Fair Value Gaps
     for i in range(2, len(candles)):
-        a = candles[i-2]
-        c = candles[i]
+        first = candles[i - 2]
+        middle = candles[i - 1]
+        third = candles[i]
 
-        if c["low"] > a["high"]:
-            low, high, side = a["high"], c["low"], "BULLISH"
-        elif c["high"] < a["low"]:
-            low, high, side = c["high"], a["low"], "BEARISH"
+        middle_body = abs(middle["close"] - middle["open"])
+
+        if middle_body < volatility * 0.35:
+            continue
+
+        if third["low"] > first["high"]:
+            low = first["high"]
+            high = third["low"]
+            side = "BULLISH"
+
+        elif third["high"] < first["low"]:
+            low = third["high"]
+            high = first["low"]
+            side = "BEARISH"
+
         else:
             continue
 
-        if high - low < volatility * 0.08:
+        if high - low < volatility * 0.05:
             continue
 
-        later = candles[i+1:current]
+        # A previous candle touching the zone makes it used.
+        previous_candles = candles[i + 1:current_index]
 
-        touched_before_now = any(
-            x["low"] <= high and x["high"] >= low
-            for x in later
+        previously_touched = any(
+            candle["low"] <= high and candle["high"] >= low
+            for candle in previous_candles
         )
 
-        now_touches = (
-            candles[current]["low"] <= high
-            and candles[current]["high"] >= low
+        current_touches = (
+            candles[-1]["low"] <= high
+            and candles[-1]["high"] >= low
         )
 
-        if not touched_before_now:
+        if not previously_touched:
             zones.append({
                 "type": "FVG",
                 "side": side,
                 "low": low,
                 "high": high,
                 "index": i,
-                "fresh": True,
-                "retest_now": now_touches,
+                "retest_now": current_touches,
             })
 
-    # Order Block: last opposing candle before the latest break
-    if event_i is not None and event in ("BULLISH", "BEARISH"):
-        start = max(0, event_i - 8)
+    # Order Block: last opposing candle before the latest structural break.
+    event_index = structure.get("event_index")
+    event_side = structure.get("event")
 
-        for i in range(event_i - 1, start - 1, -1):
+    if event_index is not None and event_side in ("BULLISH", "BEARISH"):
+        search_start = max(0, event_index - 10)
+
+        for i in range(event_index - 1, search_start - 1, -1):
             candle = candles[i]
 
-            opposite = (
-                event == "BULLISH" and candle["close"] < candle["open"]
+            opposing = (
+                event_side == "BULLISH"
+                and candle["close"] < candle["open"]
             ) or (
-                event == "BEARISH" and candle["close"] > candle["open"]
+                event_side == "BEARISH"
+                and candle["close"] > candle["open"]
             )
 
-            if not opposite:
+            if not opposing:
                 continue
 
-            low, high = candle["low"], candle["high"]
-            later = candles[i+1:current]
+            low = candle["low"]
+            high = candle["high"]
 
-            touched_before_now = any(
+            previous_candles = candles[i + 1:current_index]
+
+            previously_touched = any(
                 x["low"] <= high and x["high"] >= low
-                for x in later
+                for x in previous_candles
             )
 
-            now_touches = (
-                candles[current]["low"] <= high
-                and candles[current]["high"] >= low
+            current_touches = (
+                candles[-1]["low"] <= high
+                and candles[-1]["high"] >= low
             )
 
-            if not touched_before_now:
+            if not previously_touched:
                 zones.append({
                     "type": "OB",
-                    "side": event,
+                    "side": event_side,
                     "low": low,
                     "high": high,
                     "index": i,
-                    "fresh": True,
-                    "retest_now": now_touches,
+                    "retest_now": current_touches,
                 })
 
             break
@@ -262,51 +351,27 @@ def find_zones(candles, structure):
     for zone in zones:
         midpoint = (zone["low"] + zone["high"]) / 2
         distance = abs(price - midpoint) / max(volatility, 1e-9)
-        age = current - zone["index"]
+        age = current_index - zone["index"]
 
         zone["distance_atr"] = distance
         zone["age"] = age
-        zone["score"] = max(
+
+        zone["quality"] = max(
             0,
-            100 - min(distance, 5) * 12 - min(age, 30) * 1.2
+            100
+            - min(distance, 5) * 12
+            - min(age, 30) * 1.2,
         )
 
     zones.sort(
-        key=lambda z: (z["retest_now"], z["score"]),
+        key=lambda z: (
+            z["retest_now"],
+            z["quality"],
+        ),
         reverse=True,
     )
 
     return zones
-
-
-def liquidity_levels(candles):
-    highs, lows = find_swings(candles)
-    price = candles[-1]["close"]
-    volatility = atr(candles)
-
-    tolerance = max(volatility * 0.12, price * 0.00015)
-
-    buy = []
-    sell = []
-
-    for i, item in enumerate(highs):
-        if any(
-            abs(item["price"] - other["price"]) <= tolerance
-            for other in highs[i+1:]
-        ):
-            buy.append(item["price"])
-
-    for i, item in enumerate(lows):
-        if any(
-            abs(item["price"] - other["price"]) <= tolerance
-            for other in lows[i+1:]
-        ):
-            sell.append(item["price"])
-
-    buy = sorted(set(buy), key=lambda x: abs(x-price))[:2]
-    sell = sorted(set(sell), key=lambda x: abs(x-price))[:2]
-
-    return buy, sell
 
 
 def rejection_confirmed(candles, side, zone):
@@ -329,180 +394,223 @@ def rejection_confirmed(candles, side, zone):
             candle["close"] > candle["open"]
             and (
                 lower_wick >= body * 0.5
-                or candle["close"] >= zone["high"]
+                or candle["close"] > zone["high"]
             )
         )
 
-    return (
-        candle["close"] < candle["open"]
-        and (
-            upper_wick >= body * 0.5
-            or candle["close"] <= zone["low"]
+    if side == "BEARISH":
+        return (
+            candle["close"] < candle["open"]
+            and (
+                upper_wick >= body * 0.5
+                or candle["close"] < zone["low"]
+            )
         )
-    )
+
+    return False
 
 
-def fmt(symbol, value):
+def format_price(symbol, value):
     if value is None:
         return "n/a"
 
-    digits = (
-        2 if symbol == "XAU/USD"
-        else 3 if "JPY" in symbol
-        else 5
-    )
+    if symbol == "XAU/USD":
+        digits = 2
+    elif "JPY" in symbol:
+        digits = 3
+    else:
+        digits = 5
 
     return f"{value:.{digits}f}"
 
 
-def evaluate(symbol, h1, m15):
+def evaluate_market(symbol, h1, m15):
     h1s = analyse_structure(h1)
     m15s = analyse_structure(m15)
 
     price = m15[-1]["close"]
-    zones = find_zones(m15, m15s)
-    buy_liq, sell_liq = liquidity_levels(m15)
+    zones = detect_zones(m15, m15s)
+    buy_liquidity, sell_liquidity = find_liquidity(m15)
 
     aligned = (
         h1s["direction"] in ("BULLISH", "BEARISH")
         and h1s["direction"] == m15s["direction"]
     )
 
-    side = m15s["direction"] if aligned else None
+    side = m15s["direction"] if m15s["direction"] in (
+        "BULLISH", "BEARISH"
+    ) else None
 
     matching_zones = [
-        z for z in zones if z["side"] == side
-    ] if side else []
+        zone for zone in zones
+        if side and zone["side"] == side
+    ]
 
-    zone = matching_zones[0] if matching_zones else None
-
-    confirmed = bool(
-        zone
-        and zone["retest_now"]
-        and rejection_confirmed(m15, side, zone)
-    )
+    selected_zone = matching_zones[0] if matching_zones else None
 
     trigger = (
         m15s["bos"] == side
         or m15s["choch"] == side
     )
 
+    rejection = bool(
+        selected_zone
+        and selected_zone["retest_now"]
+        and rejection_confirmed(m15, side, selected_zone)
+    )
+
     score = 0
 
     if aligned:
         score += 30
+
     if trigger:
         score += 20
-    if zone:
+
+    if selected_zone:
         score += 15
-    if zone and zone["score"] >= 60:
+
+    if selected_zone and selected_zone["quality"] >= 60:
         score += 10
-    if zone and zone["retest_now"]:
+
+    if selected_zone and selected_zone["retest_now"]:
         score += 10
-    if confirmed:
+
+    if rejection:
         score += 15
 
     status = "NO VALID SETUP"
-    reason = "Waiting for H1/M15 directional alignment"
+    reason = "Waiting for directional confirmation"
 
     entry = sl = tp = None
 
-    if aligned:
-        status = "EARLY WARNING"
-        reason = (
-            "H1 and M15 direction agree; waiting for a fresh zone and retest"
+    if not aligned:
+        developing = (
+            m15s["event"] in ("BULLISH", "BEARISH")
+            or m15s["range_break"] in ("BULLISH", "BEARISH")
+            or m15s["choch"] in ("BULLISH", "BEARISH")
+            or m15s["bos"] in ("BULLISH", "BEARISH")
         )
+
+        if developing:
+            status = "WATCHLIST"
+            reason = (
+                "M15 has a developing structural event, "
+                "but H1/M15 alignment is not confirmed"
+            )
+
+    else:
+        status = "EARLY WARNING"
+        reason = "H1 and M15 direction agree"
 
         if trigger:
             status = "STRUCTURE ALIGNED"
-            reason = "Recent M15 structure break agrees with H1 direction"
+            reason += "; M15 structure trigger detected"
 
-        if not zone:
-            reason += "; no fresh matching FVG/OB"
-        elif not zone["retest_now"]:
+        if not selected_zone:
+            reason += "; waiting for a fresh matching zone"
+
+        elif not selected_zone["retest_now"]:
             reason += "; waiting for price to revisit the zone"
-        elif not confirmed:
-            reason += "; zone touched but rejection candle not confirmed"
-        elif score >= MIN_SCORE:
+
+        elif not rejection:
+            reason += "; retest detected but rejection not confirmed"
+
+        elif score >= MIN_ENTRY_SCORE:
             status = "ENTRY CONDITIONS MET"
             reason = (
-                "Aligned trend, fresh zone retest and M15 rejection confirmed"
+                "Directional alignment, matching zone retest "
+                "and M15 rejection conditions detected"
             )
 
             entry = price
-            volatility = atr(m15)
+            volatility = calculate_atr(m15)
             buffer = max(
                 volatility * 0.25,
                 price * 0.00015,
             )
 
             if side == "BULLISH":
-                sl = zone["low"] - buffer
+                sl = selected_zone["low"] - buffer
                 tp = entry + (entry - sl) * RR
-            else:
-                sl = zone["high"] + buffer
+
+            elif side == "BEARISH":
+                sl = selected_zone["high"] + buffer
                 tp = entry - (sl - entry) * RR
 
     return {
         "symbol": symbol,
         "status": status,
         "reason": reason,
-        "side": side,
         "h1": h1s,
         "m15": m15s,
+        "side": side,
         "price": price,
-        "zone": zone,
+        "zone": selected_zone,
         "score": score,
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "buy_liq": buy_liq,
-        "sell_liq": sell_liq,
+        "buy_liquidity": buy_liquidity,
+        "sell_liquidity": sell_liquidity,
     }
 
 
-def report_item(result):
+def report_market(result):
     symbol = result["symbol"]
-    h = result["h1"]
-    m = result["m15"]
+    h1 = result["h1"]
+    m15 = result["m15"]
     zone = result["zone"]
 
     lines = [
         f"📊 {symbol} — {result['status']}",
-        f"H1: {h['direction']} | M15: {m['direction']}",
-        f"BOS: {m['bos']} | CHOCH: {m['choch']}",
-        f"Price: {fmt(symbol, result['price'])} | Score: {result['score']}/100",
+        f"H1: {h1['direction']} | M15: {m15['direction']}",
+        (
+            f"BOS: {m15['bos']} | "
+            f"CHOCH: {m15['choch']} | "
+            f"RANGE BREAK: {m15['range_break']}"
+        ),
+        (
+            f"Price: {format_price(symbol, result['price'])} | "
+            f"Score: {result['score']}/100"
+        ),
         f"Reason: {result['reason']}",
     ]
 
     if zone:
         lines.append(
             f"Zone: {zone['type']} {zone['side']} "
-            f"{fmt(symbol, zone['low'])}–{fmt(symbol, zone['high'])} | "
-            f"{'RETEST NOW' if zone['retest_now'] else 'WAITING'} | "
-            f"quality {zone['score']:.0f}/100"
+            f"{format_price(symbol, zone['low'])}–"
+            f"{format_price(symbol, zone['high'])}"
+        )
+
+        lines.append(
+            f"Zone quality: {zone['quality']:.0f}/100 | "
+            f"{'RETEST NOW' if zone['retest_now'] else 'WAITING FOR RETEST'}"
         )
     else:
-        lines.append("Zone: none fresh and aligned")
+        lines.append("Zone: No fresh matching zone")
 
-    if result["buy_liq"]:
-        lines.append(
-            "Potential buy-side liquidity: "
-            + ", ".join(fmt(symbol, x) for x in result["buy_liq"])
-        )
+    if result["buy_liquidity"]:
+        values = [
+            f"{format_price(symbol, x['level'])} ({x['touches']} touches)"
+            for x in result["buy_liquidity"]
+        ]
+        lines.append("Potential buy-side liquidity: " + ", ".join(values))
 
-    if result["sell_liq"]:
-        lines.append(
-            "Potential sell-side liquidity: "
-            + ", ".join(fmt(symbol, x) for x in result["sell_liq"])
-        )
+    if result["sell_liquidity"]:
+        values = [
+            f"{format_price(symbol, x['level'])} ({x['touches']} touches)"
+            for x in result["sell_liquidity"]
+        ]
+        lines.append("Potential sell-side liquidity: " + ", ".join(values))
 
     if result["status"] == "ENTRY CONDITIONS MET":
         lines.extend([
-            f"Conditional entry: {fmt(symbol, result['entry'])}",
-            f"Suggested SL: {fmt(symbol, result['sl'])}",
-            f"Suggested TP (1:{RR:g}): {fmt(symbol, result['tp'])}",
-            "Alert only — verify spread, candle close and risk before any trade.",
+            f"Conditional entry: {format_price(symbol, result['entry'])}",
+            f"Suggested SL: {format_price(symbol, result['sl'])}",
+            f"Suggested TP (1:{RR:g}): {format_price(symbol, result['tp'])}",
+            "Check spread and candle close before considering any trade.",
         ])
 
     return "\n".join(lines)
@@ -510,63 +618,73 @@ def report_item(result):
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing Telegram secrets")
+        raise RuntimeError("Missing Telegram bot token or chat ID")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     response = requests.post(
         url,
-        json={"chat_id": CHAT_ID, "text": message},
-        timeout=20,
+        json={
+            "chat_id": CHAT_ID,
+            "text": message,
+        },
+        timeout=25,
     )
 
     response.raise_for_status()
-    result = response.json()
+    data = response.json()
 
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram error: {result}")
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram delivery failed: {data}")
 
 
 def main():
-    if not API_KEY or not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("One or more required GitHub secrets are missing")
+    if not API_KEY:
+        raise RuntimeError("Missing Twelve Data API key")
+
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("Missing Telegram credentials")
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     reports = [
-        f"🤖 ODJ AI SMART TRADER V5\n"
-        f"Scan: {stamp}\n"
-        f"Mode: ALERT ONLY\n"
+        "🤖 ODJ AI SMART TRADER V6",
+        f"Scan: {stamp}",
+        "Mode: ALERT ONLY",
+        "Timeframes: H1 + M15",
     ]
 
     errors = []
 
     for symbol in SYMBOLS:
         try:
-            h1 = api_candles(symbol, INTERVALS["H1"])
+            h1 = fetch_candles(symbol, TIMEFRAMES["H1"])
             time.sleep(1)
 
-            m15 = api_candles(symbol, INTERVALS["M15"])
+            m15 = fetch_candles(symbol, TIMEFRAMES["M15"])
 
-            result = evaluate(symbol, h1, m15)
-            reports.append(report_item(result))
+            result = evaluate_market(symbol, h1, m15)
+            reports.append(report_market(result))
 
-        except Exception as exc:
-            errors.append(f"{symbol}: {exc}")
+        except Exception as error:
+            errors.append(f"{symbol}: {error}")
 
         time.sleep(1)
 
     if errors:
         reports.append(
-            "⚠️ DATA/API ISSUES\n" + "\n".join(errors)
+            "⚠️ DATA/API ERRORS\n" + "\n".join(errors)
         )
 
     reports.append(
-        "⚠️ Structure and zone rules are estimates, not guaranteed signals. "
-        "No trade is placed automatically."
+        "WATCHLIST is not an entry signal. "
+        "Structure, liquidity and zones are estimates. "
+        "No trades are placed automatically."
     )
 
     message = "\n\n".join(reports)
+
+    # Keep each Telegram message below the message size limit.
     chunks = []
 
     while len(message) > 3900:
@@ -584,8 +702,8 @@ def main():
     for chunk in chunks:
         send_telegram(chunk)
 
-    if errors and len(errors) == len(SYMBOLS):
-        raise RuntimeError("All symbols failed; check the Telegram error report")
+    if len(errors) == len(SYMBOLS):
+        raise RuntimeError("All four markets failed to return data")
 
 
 if __name__ == "__main__":

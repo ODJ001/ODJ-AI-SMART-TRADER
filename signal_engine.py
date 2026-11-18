@@ -2,7 +2,7 @@
 import os
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 API_KEY = os.getenv("TWELVEDATA_API_KEY")
@@ -17,11 +17,13 @@ SYMBOLS = [
 ]
 
 CANDLE_COUNT = 100
+CANDLE_GRACE_SECONDS = 60
 MODE = "DEMO - ANALYSIS ONLY"
 
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
     response = requests.post(
         url,
         data={"chat_id": CHAT_ID, "text": message},
@@ -42,8 +44,8 @@ def fetch_candles(symbol, interval):
         },
         timeout=30
     )
-    response.raise_for_status()
 
+    response.raise_for_status()
     data = response.json()
 
     if "values" not in data:
@@ -54,30 +56,48 @@ def fetch_candles(symbol, interval):
     return data["values"]
 
 
-def prepare_candles(raw):
-    # Twelve Data returns newest candles first.
-    # Discard the newest candle to avoid analysing
-    # a candle that may still be forming.
-    if len(raw) < 20:
-        raise RuntimeError("Insufficient candle history")
+def prepare_candles(raw, interval):
+    durations = {
+        "15min": timedelta(minutes=15),
+        "1h": timedelta(hours=1)
+    }
 
-    completed = raw[1:]
+    if interval not in durations:
+        raise RuntimeError("Unsupported candle interval")
 
-    # Convert to chronological order.
-    completed = list(reversed(completed))
+    duration = durations[interval]
+    now = datetime.now(LAGOS)
+    grace = timedelta(seconds=CANDLE_GRACE_SECONDS)
 
-    return [
-        {
-            "time": datetime.strptime(
-                candle["datetime"], "%Y-%m-%d %H:%M:%S"
-            ),
+    completed = []
+
+    for candle in raw:
+        candle_time = datetime.strptime(
+            candle["datetime"],
+            "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=LAGOS)
+
+        candle_close_time = candle_time + duration
+
+        if candle_close_time + grace > now:
+            continue
+
+        completed.append({
+            "time": candle_time,
             "open": float(candle["open"]),
             "high": float(candle["high"]),
             "low": float(candle["low"]),
             "close": float(candle["close"])
-        }
-        for candle in completed
-    ]
+        })
+
+    completed.sort(key=lambda item: item["time"])
+
+    if len(completed) < 20:
+        raise RuntimeError(
+            "Insufficient completed candle history"
+        )
+
+    return completed
 
 
 def find_swings(candles):
@@ -204,12 +224,9 @@ def find_order_block(candles):
 
 def analyse_market(symbol, interval):
     raw = fetch_candles(symbol, interval)
-    candles = prepare_candles(raw)
+    candles = prepare_candles(raw, interval)
 
     structure = analyse_structure(candles)
-
-    fvg = find_fvg(candles)
-    order_block = find_order_block(candles)
 
     return {
         "symbol": symbol,
@@ -222,8 +239,8 @@ def analyse_market(symbol, interval):
         "bos": structure["bos"],
         "choch": structure["choch"],
         "sweep": structure["sweep"],
-        "fvg": fvg,
-        "order_block": order_block
+        "fvg": find_fvg(candles),
+        "order_block": find_order_block(candles)
     }
 
 
@@ -240,14 +257,13 @@ def main():
         "MARKET STRUCTURE ANALYSIS",
         f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} WAT",
         f"Mode: {MODE}",
+        "Completed candles only.",
         "No trades will be placed."
     ]
 
     successful = 0
     failed = 0
 
-    # M15 is scanned every run.
-    # H1 is scanned only at the start of each Lagos hour.
     intervals = ["15min"]
 
     if now.minute < 15:

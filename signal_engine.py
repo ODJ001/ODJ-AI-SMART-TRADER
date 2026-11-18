@@ -19,7 +19,6 @@ SYMBOLS = [
 CANDLE_COUNT = 100
 CANDLE_GRACE_SECONDS = 60
 REQUEST_DELAY = 10
-
 MODE = "DEMO - ANALYSIS ONLY"
 
 
@@ -66,8 +65,8 @@ def prepare_candles(raw, interval):
     if interval not in durations:
         raise RuntimeError("Unsupported interval")
 
-    now = datetime.now(LAGOS)
     duration = durations[interval]
+    now = datetime.now(LAGOS)
     grace = timedelta(seconds=CANDLE_GRACE_SECONDS)
 
     candles = []
@@ -101,7 +100,7 @@ def find_swings(candles):
     highs = []
     lows = []
 
-    # A swing is confirmed only after two candles on its right.
+    # A swing is confirmed after two candles on its right.
     for i in range(2, len(candles) - 2):
         current = candles[i]
 
@@ -126,6 +125,21 @@ def find_swings(candles):
     return highs, lows
 
 
+def average_body(candles, end_index, count=10):
+    start = max(0, end_index - count)
+    sample = candles[start:end_index]
+
+    if not sample:
+        return 0
+
+    bodies = [
+        abs(c["close"] - c["open"])
+        for c in sample
+    ]
+
+    return sum(bodies) / len(bodies)
+
+
 def analyse_structure(candles):
     highs, lows = find_swings(candles)
 
@@ -144,7 +158,6 @@ def analyse_structure(candles):
     latest = candles[-1]
     previous = candles[-2]
 
-    # Use only swing levels formed before the latest candle.
     prior_highs = [
         item for item in highs
         if item["index"] < len(candles) - 1
@@ -164,37 +177,43 @@ def analyse_structure(candles):
     result["swing_high"] = swing_high
     result["swing_low"] = swing_low
 
-    # Break of structure and possible change of character.
+    # Estimate the preceding trend from swing progression.
+    previous_trend = "UNCLEAR"
+
+    if len(highs) >= 2 and len(lows) >= 2:
+        higher_high = highs[-1]["price"] > highs[-2]["price"]
+        higher_low = lows[-1]["price"] > lows[-2]["price"]
+        lower_high = highs[-1]["price"] < highs[-2]["price"]
+        lower_low = lows[-1]["price"] < lows[-2]["price"]
+
+        if higher_high and higher_low:
+            previous_trend = "BULLISH"
+        elif lower_high and lower_low:
+            previous_trend = "BEARISH"
+
+    # BOS and possible CHOCH require a candle close beyond a swing.
     if latest["close"] > swing_high:
         result["bos"] = "BULLISH"
         result["direction"] = "BULLISH"
 
-        if previous["close"] <= swing_high:
+        if previous_trend == "BEARISH":
             result["choch"] = "BULLISH"
 
     elif latest["close"] < swing_low:
         result["bos"] = "BEARISH"
         result["direction"] = "BEARISH"
 
-        if previous["close"] >= swing_low:
+        if previous_trend == "BULLISH":
             result["choch"] = "BEARISH"
 
     else:
-        # Use recent confirmed swing progression as a trend estimate.
-        if len(highs) >= 2 and len(lows) >= 2:
-            higher_high = highs[-1]["price"] > highs[-2]["price"]
-            higher_low = lows[-1]["price"] > lows[-2]["price"]
-            lower_high = highs[-1]["price"] < highs[-2]["price"]
-            lower_low = lows[-1]["price"] < lows[-2]["price"]
+        result["direction"] = (
+            previous_trend
+            if previous_trend != "UNCLEAR"
+            else "RANGING"
+        )
 
-            if higher_high and higher_low:
-                result["direction"] = "BULLISH"
-            elif lower_high and lower_low:
-                result["direction"] = "BEARISH"
-            else:
-                result["direction"] = "RANGING"
-
-    # Liquidity sweep: price crosses a prior swing and closes back inside.
+    # Sweep must cross a previously confirmed swing and close back inside.
     if (
         latest["low"] < swing_low
         and latest["close"] > swing_low
@@ -210,40 +229,121 @@ def analyse_structure(candles):
     return result
 
 
-def find_fvg(candles):
-    if len(candles) < 3:
-        return "NONE"
+def find_fvg(candles, lookback=20):
+    # Find the most recent unmitigated three-candle gap.
+    start = max(2, len(candles) - lookback)
 
-    first = candles[-3]
-    third = candles[-1]
+    for i in range(len(candles) - 1, start - 1, -1):
+        first = candles[i - 2]
+        middle = candles[i - 1]
+        third = candles[i]
 
-    if first["high"] < third["low"]:
-        return "BULLISH FVG"
+        if first["high"] < third["low"]:
+            lower = first["high"]
+            upper = third["low"]
 
-    if first["low"] > third["high"]:
-        return "BEARISH FVG"
+            later = candles[i + 1:]
 
-    return "NONE"
+            mitigated = any(
+                candle["low"] <= upper
+                for candle in later
+            )
+
+            if not mitigated:
+                return {
+                    "type": "BULLISH FVG",
+                    "lower": lower,
+                    "upper": upper
+                }
+
+        if first["low"] > third["high"]:
+            lower = third["high"]
+            upper = first["low"]
+
+            later = candles[i + 1:]
+
+            mitigated = any(
+                candle["high"] >= lower
+                for candle in later
+            )
+
+            if not mitigated:
+                return {
+                    "type": "BEARISH FVG",
+                    "lower": lower,
+                    "upper": upper
+                }
+
+    return {
+        "type": "NONE",
+        "lower": None,
+        "upper": None
+    }
 
 
 def find_order_block(candles, structure):
     direction = structure["direction"]
 
+    swing_high = structure["swing_high"]
+    swing_low = structure["swing_low"]
+
+    if direction not in ("BULLISH", "BEARISH"):
+        return {
+            "type": "NONE",
+            "lower": None,
+            "upper": None
+        }
+
+    latest = candles[-1]
+    avg_body = average_body(candles, len(candles) - 1)
+
+    latest_body = abs(latest["close"] - latest["open"])
+
+    # Require a strong candle body and a structural break.
+    if avg_body == 0 or latest_body < avg_body * 1.5:
+        return {
+            "type": "NONE",
+            "lower": None,
+            "upper": None
+        }
+
     if direction == "BULLISH":
-        for i in range(len(candles) - 2, max(-1, len(candles) - 7), -1):
-            candle = candles[i]
+        if swing_high is None or latest["close"] <= swing_high:
+            return {
+                "type": "NONE",
+                "lower": None,
+                "upper": None
+            }
 
+        for candle in reversed(candles[-8:-1]):
             if candle["close"] < candle["open"]:
-                return "POSSIBLE BULLISH OB"
+                return {
+                    "type": "POSSIBLE BULLISH OB",
+                    "lower": candle["low"],
+                    "upper": candle["high"]
+                }
 
-    elif direction == "BEARISH":
-        for i in range(len(candles) - 2, max(-1, len(candles) - 7), -1):
-            candle = candles[i]
+    if direction == "BEARISH":
+        if swing_low is None or latest["close"] >= swing_low:
+            return {
+                "type": "NONE",
+                "lower": None,
+                "upper": None
+            }
 
+        for candle in reversed(candles[-8:-1]):
             if candle["close"] > candle["open"]:
-                return "POSSIBLE BEARISH OB"
+                return {
+                    "type": "POSSIBLE BEARISH OB",
+                    "lower": candle["low"],
+                    "upper": candle["high"]
+                }
 
-    return "NONE"
+    return {
+        "type": "NONE",
+        "lower": None,
+        "upper": None
+    }
 
 
 def analyse_market(symbol, interval):
@@ -251,6 +351,8 @@ def analyse_market(symbol, interval):
     candles = prepare_candles(raw, interval)
 
     structure = analyse_structure(candles)
+    fvg = find_fvg(candles)
+    order_block = find_order_block(candles, structure)
 
     return {
         "symbol": symbol,
@@ -261,8 +363,8 @@ def analyse_market(symbol, interval):
         "bos": structure["bos"],
         "choch": structure["choch"],
         "sweep": structure["sweep"],
-        "fvg": find_fvg(candles),
-        "order_block": find_order_block(candles, structure)
+        "fvg": fvg,
+        "order_block": order_block
     }
 
 
@@ -276,57 +378,75 @@ def confirmation_check(h1, m15):
     direction = h1["direction"]
 
     if direction == "BULLISH":
-        correct_sweep = m15["sweep"] == "SELL-SIDE LIQUIDITY"
-        correct_choch = m15["choch"] == "BULLISH"
-        correct_zone = (
-            m15["fvg"] == "BULLISH FVG"
-            or m15["order_block"] == "POSSIBLE BULLISH OB"
+        correct_sweep = (
+            m15["sweep"] == "SELL-SIDE LIQUIDITY"
         )
+        correct_choch = m15["choch"] == "BULLISH"
+        correct_fvg = m15["fvg"]["type"] == "BULLISH FVG"
+        correct_ob = (
+            m15["order_block"]["type"] == "POSSIBLE BULLISH OB"
+        )
+
     else:
-        correct_sweep = m15["sweep"] == "BUY-SIDE LIQUIDITY"
+        correct_sweep = (
+            m15["sweep"] == "BUY-SIDE LIQUIDITY"
+        )
         correct_choch = m15["choch"] == "BEARISH"
-        correct_zone = (
-            m15["fvg"] == "BEARISH FVG"
-            or m15["order_block"] == "POSSIBLE BEARISH OB"
+        correct_fvg = m15["fvg"]["type"] == "BEARISH FVG"
+        correct_ob = (
+            m15["order_block"]["type"] == "POSSIBLE BEARISH OB"
         )
 
     if not correct_sweep:
         return "WAIT - LIQUIDITY SWEEP NOT CONFIRMED"
 
     if not correct_choch:
-        return "WAIT - M15 CHOCH NOT CONFIRMED"
+        return "WAIT - CHOCH NOT CONFIRMED"
 
-    if not correct_zone:
-        return "WAIT - NO MATCHING FVG OR ORDER BLOCK"
+    if not (correct_fvg or correct_ob):
+        return "WAIT - NO MATCHING ENTRY ZONE"
 
-    return "POTENTIAL SETUP - REQUIRES FURTHER VALIDATION"
+    return "POTENTIAL SETUP - MANUAL REVIEW REQUIRED"
+
+
+def format_zone(zone):
+    if zone["type"] == "NONE":
+        return "NONE"
+
+    return (
+        f"{zone['type']} "
+        f"({zone['lower']} - {zone['upper']})"
+    )
 
 
 def format_report(symbol, h1, m15):
-    status = confirmation_check(h1, m15)
-
     return (
         f"\n{symbol}"
         f"\nH1 direction: {h1['direction']}"
         f"\nH1 BOS: {h1['bos']}"
+        f"\nH1 CHOCH: {h1['choch']}"
         f"\nM15 direction: {m15['direction']}"
         f"\nM15 BOS: {m15['bos']}"
         f"\nM15 CHOCH: {m15['choch']}"
         f"\nM15 liquidity sweep: {m15['sweep']}"
-        f"\nM15 FVG: {m15['fvg']}"
-        f"\nM15 Order Block: {m15['order_block']}"
-        f"\nAssessment: {status}"
+        f"\nM15 FVG: {format_zone(m15['fvg'])}"
+        f"\nM15 Order Block: {format_zone(m15['order_block'])}"
+        f"\nAssessment: {confirmation_check(h1, m15)}"
         f"\nM15 completed candle: {m15['time']}"
     )
 
 
 def main():
     if not API_KEY or not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("A required GitHub secret is missing.")
+        raise RuntimeError(
+            "A required GitHub secret is missing."
+        )
 
     intervals = [
         item.strip()
-        for item in os.getenv("SCAN_INTERVALS", "15min").split(",")
+        for item in os.getenv(
+            "SCAN_INTERVALS", "15min"
+        ).split(",")
         if item.strip() in ("15min", "1h")
     ]
 
@@ -348,7 +468,6 @@ def main():
 
     for symbol in SYMBOLS:
         try:
-            # The M15 workflow checks H1 first, then M15.
             if "15min" in intervals:
                 h1 = analyse_market(symbol, "1h")
                 time.sleep(REQUEST_DELAY)
@@ -358,14 +477,15 @@ def main():
 
             else:
                 h1 = analyse_market(symbol, "1h")
+
                 results.append(
                     f"\n{symbol} | H1"
                     f"\nDirection: {h1['direction']}"
                     f"\nBOS: {h1['bos']}"
                     f"\nCHOCH: {h1['choch']}"
                     f"\nLiquidity sweep: {h1['sweep']}"
-                    f"\nFVG: {h1['fvg']}"
-                    f"\nOrder Block: {h1['order_block']}"
+                    f"\nFVG: {format_zone(h1['fvg'])}"
+                    f"\nOrder Block: {format_zone(h1['order_block'])}"
                     f"\nCompleted candle: {h1['time']}"
                 )
 
@@ -385,7 +505,8 @@ def main():
         f"Successful symbols: {successful}",
         f"Failed symbols: {failed}",
         "DEMO MODE - NO TRADES PLACED",
-        "Assessments are not validated trading signals."
+        "Potential setups require manual review.",
+        "This strategy has not been validated for profitability."
     ])
 
     send_telegram("\n".join(results))

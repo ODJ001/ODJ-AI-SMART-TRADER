@@ -31,6 +31,7 @@ def fetch_candles(symbol, interval):
             "symbol": symbol,
             "interval": interval,
             "outputsize": CANDLE_COUNT,
+            "timezone": "Africa/Lagos",
             "apikey": API_KEY
         },
         timeout=30
@@ -46,6 +47,7 @@ def main():
     results = [
         "ODJ AI SMART TRADER",
         "HISTORICAL MARKET DATA TEST",
+        "Timezone: Africa/Lagos (WAT)",
         "Mode: DEMO"
     ]
 
@@ -70,7 +72,7 @@ def main():
                     results.append(
                         f"\n{symbol} | {interval}: SUCCESS"
                         f"\nCandles: {len(candles)}"
-                        f"\nTime: {latest['datetime']}"
+                        f"\nTime (Lagos): {latest['datetime']}"
                         f"\nOpen: {latest['open']}"
                         f"\nHigh: {latest['high']}"
                         f"\nLow: {latest['low']}"

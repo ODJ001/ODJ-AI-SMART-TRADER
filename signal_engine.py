@@ -5,7 +5,8 @@ import requests
 from datetime import datetime, timezone
 
 # ==========================================
-# ODJ AI SMART TRADER V3
+# ODJ AI SMART TRADER V4
+# PRECISION FILTER
 # ==========================================
 
 API_KEY = os.getenv("TWELVE_DATA_API_KEY")
@@ -13,14 +14,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://api.twelvedata.com"
+
 SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
 
 CANDLE_LIMIT = 100
 REQUEST_DELAY = 9
 RR_RATIO = 2.0
 ATR_PERIOD = 14
+SWING_LEFT = 2
+SWING_RIGHT = 2
+BREAK_LOOKBACK = 12
 ZONE_LOOKBACK = 40
-OB_LOOKBACK = 30
 
 session = requests.Session()
 
@@ -68,24 +72,24 @@ def get_candles(symbol, interval):
     if len(candles) < 30:
         raise RuntimeError("Insufficient candle history")
 
-    # Exclude the currently forming candle
+    # Do not analyse the currently forming candle.
     return candles[:-1]
 
 
 # ==========================================
-# SWING DETECTION
+# SWINGS
 # ==========================================
 
-def find_swings(candles, left=2, right=2):
+def find_swings(candles):
     highs = []
     lows = []
 
-    for i in range(left, len(candles) - right):
+    for i in range(SWING_LEFT, len(candles) - SWING_RIGHT):
         current = candles[i]
 
         surrounding = (
-            candles[i-left:i] +
-            candles[i+1:i+right+1]
+            candles[i-SWING_LEFT:i]
+            + candles[i+1:i+SWING_RIGHT+1]
         )
 
         if all(current["high"] > c["high"] for c in surrounding):
@@ -104,7 +108,7 @@ def find_swings(candles, left=2, right=2):
 
 
 # ==========================================
-# MARKET STRUCTURE
+# STRUCTURE AND RECENT BREAK DETECTION
 # ==========================================
 
 def analyse_structure(candles):
@@ -117,68 +121,101 @@ def analyse_structure(candles):
         "sweep": "NONE",
         "swing_high": None,
         "swing_low": None,
-        "break_index": None
+        "break_index": None,
+        "break_type": "NONE"
     }
 
     if len(highs) < 2 or len(lows) < 2:
         return result
 
-    latest = candles[-1]
-    previous = candles[-2]
+    last_highs = highs[-2:]
+    last_lows = lows[-2:]
 
-    swing_high = highs[-1]["price"]
-    swing_low = lows[-1]["price"]
+    higher_high = last_highs[-1]["price"] > last_highs[-2]["price"]
+    higher_low = last_lows[-1]["price"] > last_lows[-2]["price"]
 
-    result["swing_high"] = swing_high
-    result["swing_low"] = swing_low
-
-    higher_high = highs[-1]["price"] > highs[-2]["price"]
-    higher_low = lows[-1]["price"] > lows[-2]["price"]
-
-    lower_high = highs[-1]["price"] < highs[-2]["price"]
-    lower_low = lows[-1]["price"] < lows[-2]["price"]
-
-    previous_trend = "RANGING"
+    lower_high = last_highs[-1]["price"] < last_highs[-2]["price"]
+    lower_low = last_lows[-1]["price"] < last_lows[-2]["price"]
 
     if higher_high and higher_low:
-        previous_trend = "BULLISH"
+        trend = "BULLISH"
     elif lower_high and lower_low:
-        previous_trend = "BEARISH"
+        trend = "BEARISH"
+    else:
+        trend = "RANGING"
 
-    result["direction"] = previous_trend
+    result["direction"] = trend
+    result["swing_high"] = last_highs[-1]["price"]
+    result["swing_low"] = last_lows[-1]["price"]
 
-    bullish_break = (
-        previous["close"] <= swing_high
-        and latest["close"] > swing_high
-    )
+    # Look for recent close-based breaks of confirmed swings.
+    recent_start = max(1, len(candles) - BREAK_LOOKBACK)
+    events = []
 
-    bearish_break = (
-        previous["close"] >= swing_low
-        and latest["close"] < swing_low
-    )
+    for i in range(recent_start, len(candles)):
+        previous = candles[i-1]
+        current = candles[i]
 
-    if bullish_break:
-        result["direction"] = "BULLISH"
-        result["break_index"] = len(candles) - 1
+        available_highs = [s for s in highs if s["index"] < i]
+        available_lows = [s for s in lows if s["index"] < i]
 
-        if previous_trend == "BEARISH":
-            result["choch"] = "BULLISH"
+        if available_highs:
+            level = available_highs[-1]["price"]
+
+            if previous["close"] <= level and current["close"] > level:
+                events.append({
+                    "index": i,
+                    "direction": "BULLISH",
+                    "level": level
+                })
+
+        if available_lows:
+            level = available_lows[-1]["price"]
+
+            if previous["close"] >= level and current["close"] < level:
+                events.append({
+                    "index": i,
+                    "direction": "BEARISH",
+                    "level": level
+                })
+
+    if events:
+        event = events[-1]
+        result["break_index"] = event["index"]
+        result["break_type"] = event["direction"]
+
+        if event["direction"] == "BULLISH":
+            result["direction"] = "BULLISH"
+
+            if trend == "BEARISH":
+                result["choch"] = "BULLISH"
+            else:
+                result["bos"] = "BULLISH"
+
         else:
-            result["bos"] = "BULLISH"
+            result["direction"] = "BEARISH"
 
-    elif bearish_break:
-        result["direction"] = "BEARISH"
-        result["break_index"] = len(candles) - 1
+            if trend == "BULLISH":
+                result["choch"] = "BEARISH"
+            else:
+                result["bos"] = "BEARISH"
 
-        if previous_trend == "BULLISH":
-            result["choch"] = "BEARISH"
-        else:
-            result["bos"] = "BEARISH"
+    # Latest confirmed swing levels for liquidity checks.
+    latest = candles[-1]
 
-    if latest["low"] < swing_low and latest["close"] > swing_low:
+    swing_high = result["swing_high"]
+    swing_low = result["swing_low"]
+
+    if (
+        latest["low"] < swing_low
+        and latest["close"] > swing_low
+    ):
         result["sweep"] = "SELL-SIDE LIQUIDITY"
 
-    elif latest["high"] > swing_high and latest["close"] < swing_high:
+    elif (
+        latest["high"] > swing_high
+        and latest["close"] < swing_high
+    ):
         result["sweep"] = "BUY-SIDE LIQUIDITY"
 
     return result
@@ -210,7 +247,18 @@ def calculate_atr(candles, period=ATR_PERIOD):
 
 
 # ==========================================
-# VALID FVG DETECTION
+# ZONE OVERLAP
+# ==========================================
+
+def candle_overlaps_zone(candle, zone):
+    return (
+        candle["low"] <= zone["high"]
+        and candle["high"] >= zone["low"]
+    )
+
+
+# ==========================================
+# FVG DETECTION
 # ==========================================
 
 def find_valid_fvg(candles, direction):
@@ -219,29 +267,98 @@ def find_valid_fvg(candles, direction):
 
     for i in range(start, len(candles)):
         first = candles[i-2]
+        middle = candles[i-1]
         third = candles[i]
 
         zone = None
 
-        if direction == "BULLISH" and third["low"] > first["high"]:
-            zone = {
-                "type": "BULLISH FVG",
-                "low": first["high"],
-                "high": third["low"],
-                "index": i
-            }
+        if direction == "BULLISH":
+            if third["low"] > first["high"]:
+                zone = {
+                    "type": "BULLISH FVG",
+                    "low": first["high"],
+                    "high": third["low"],
+                    "index": i
+                }
 
-        elif direction == "BEARISH" and third["high"] < first["low"]:
-            zone = {
-                "type": "BEARISH FVG",
-                "low": third["high"],
-                "high": first["low"],
-                "index": i
-            }
+        elif direction == "BEARISH":
+            if third["high"] < first["low"]:
+                zone = {
+                    "type": "BEARISH FVG",
+                    "low": third["high"],
+                    "high": first["low"],
+                    "index": i
+                }
 
         if zone is None:
             continue
 
+        # Ignore a gap already revisited by any earlier
+        # closed candle after its formation.
+        earlier_after_formation = candles[i+1:-1]
+
+        previously_touched = any(
+            candle_overlaps_zone(c, zone)
+            for c in earlier_after_formation
+        )
+
+        if previously_touched:
+            continue
+
+        # The latest closed candle may be the retest candle.
+        zone["retested_now"] = candle_overlaps_zone(
+            candles[-1], zone
+        )
+
+        zones.append(zone)
+
+    return zones[-1] if zones else None
+
+
+# ==========================================
+# ORDER BLOCK DETECTION
+# ==========================================
+
+def find_valid_order_block(candles, direction, structure):
+    break_index = structure["break_index"]
+
+    if break_index is None:
+        return None
+
+    if structure["break_type"] != direction:
+        return None
+
+    search_start = max(0, break_index - 8)
+
+    for i in range(break_index - 1, search_start - 1, -1):
+        candle = candles[i]
+
+        if direction == "BULLISH":
+            if candle["close"] >= candle["open"]:
+                continue
+        else:
+            if candle["close"] <= candle["open"]:
+                continue
+
+        zone = {
+            "type": direction + " ORDER BLOCK",
+            "low": candle["low"],
+            "high": candle["high"],
+            "index": i
+        }
+
+        # Exclude zones touched before the latest candle.
+        earlier_after_formation = candles[i+1:-1]
+
+        previously_touched = any(
+            candle_overlaps_zone(c, zone)
+            for c in earlier_after_formation
+        )
+
+        if previously_touched:
+            continue
+
+        # Reject invalidation by a close beyond the zone.
         later_candles = candles[i+1:]
 
         if direction == "BULLISH":
@@ -258,99 +375,11 @@ def find_valid_fvg(candles, direction):
         if invalidated:
             continue
 
-        # Track whether price has already entered the zone.
-        zone["mitigated"] = any(
-            c["low"] <= zone["high"]
-            and c["high"] >= zone["low"]
-            for c in later_candles
+        zone["retested_now"] = candle_overlaps_zone(
+            candles[-1], zone
         )
 
-        zones.append(zone)
-
-    return zones[-1] if zones else None
-
-
-# ==========================================
-# HISTORICAL ORDER BLOCK DETECTION
-# ==========================================
-
-def find_valid_order_block(candles, direction):
-    start = max(20, len(candles) - OB_LOOKBACK)
-
-    for break_index in range(len(candles) - 1, start - 1, -1):
-        history = candles[:break_index]
-
-        highs, lows = find_swings(history)
-
-        if not highs or not lows:
-            continue
-
-        previous = candles[break_index - 1]
-        current = candles[break_index]
-
-        bullish_break = (
-            previous["close"] <= highs[-1]["price"]
-            and current["close"] > highs[-1]["price"]
-        )
-
-        bearish_break = (
-            previous["close"] >= lows[-1]["price"]
-            and current["close"] < lows[-1]["price"]
-        )
-
-        if direction == "BULLISH" and not bullish_break:
-            continue
-
-        if direction == "BEARISH" and not bearish_break:
-            continue
-
-        search_start = max(0, break_index - 8)
-
-        for i in range(break_index - 1, search_start - 1, -1):
-            candle = candles[i]
-
-            if direction == "BULLISH" and candle["close"] < candle["open"]:
-                zone = {
-                    "type": "BULLISH ORDER BLOCK",
-                    "low": candle["low"],
-                    "high": candle["high"],
-                    "index": i
-                }
-
-            elif direction == "BEARISH" and candle["close"] > candle["open"]:
-                zone = {
-                    "type": "BEARISH ORDER BLOCK",
-                    "low": candle["low"],
-                    "high": candle["high"],
-                    "index": i
-                }
-
-            else:
-                continue
-
-            later_candles = candles[i+1:]
-
-            if direction == "BULLISH":
-                invalidated = any(
-                    c["close"] < zone["low"]
-                    for c in later_candles
-                )
-            else:
-                invalidated = any(
-                    c["close"] > zone["high"]
-                    for c in later_candles
-                )
-
-            if invalidated:
-                continue
-
-            zone["mitigated"] = any(
-                c["low"] <= zone["high"]
-                and c["high"] >= zone["low"]
-                for c in later_candles
-            )
-
-            return zone
+        return zone
 
     return None
 
@@ -361,17 +390,12 @@ def find_valid_order_block(candles, direction):
 
 def check_retest(candles, zone, direction):
     if zone is None:
-        return False, "No valid zone found"
+        return False, "No fresh FVG or Order Block"
 
     candle = candles[-1]
 
-    overlap = (
-        candle["low"] <= zone["high"]
-        and candle["high"] >= zone["low"]
-    )
-
-    if not overlap:
-        return False, "Price has not revisited the zone"
+    if not candle_overlaps_zone(candle, zone):
+        return False, "Price has not revisited the fresh zone"
 
     body = abs(candle["close"] - candle["open"])
 
@@ -380,38 +404,50 @@ def check_retest(candles, zone, direction):
 
     midpoint = (zone["low"] + zone["high"]) / 2
 
-    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-    upper_wick = candle["high"] - max(candle["open"], candle["close"])
+    lower_wick = min(
+        candle["open"], candle["close"]
+    ) - candle["low"]
+
+    upper_wick = candle["high"] - max(
+        candle["open"], candle["close"]
+    )
 
     if direction == "BULLISH":
-        confirmed = (
+        valid = (
             candle["close"] > candle["open"]
             and candle["close"] >= midpoint
             and lower_wick >= body * 0.5
         )
 
-        if not confirmed:
-            return False, "Bullish rejection candle not confirmed"
+        if not valid:
+            return False, "Bullish M15 rejection not confirmed"
 
     else:
-        confirmed = (
+        valid = (
             candle["close"] < candle["open"]
             and candle["close"] <= midpoint
             and upper_wick >= body * 0.5
         )
 
-        if not confirmed:
-            return False, "Bearish rejection candle not confirmed"
+        if not valid:
+            return False, "Bearish M15 rejection not confirmed"
 
-    return True, "Directional M15 rejection confirmed"
+    return True, "Fresh-zone retest and rejection confirmed"
 
 
 # ==========================================
-# ENTRY AND RISK MANAGEMENT
+# ENTRY AND RISK
 # ==========================================
 
 def calculate_entry(candles, zone, direction):
     if zone is None:
+        return None
+
+    confirmed, reason = check_retest(
+        candles, zone, direction
+    )
+
+    if not confirmed:
         return None
 
     atr = calculate_atr(candles)
@@ -419,12 +455,8 @@ def calculate_entry(candles, zone, direction):
     if atr is None or atr <= 0:
         return None
 
-    confirmed, reason = check_retest(candles, zone, direction)
-
-    if not confirmed:
-        return None
-
-    entry = candles[-1]["close"]
+    last = candles[-1]
+    entry = last["close"]
     buffer = atr * 0.2
 
     if direction == "BULLISH":
@@ -434,7 +466,7 @@ def calculate_entry(candles, zone, direction):
         if risk <= 0:
             return None
 
-        take_profit = entry + (risk * RR_RATIO)
+        take_profit = entry + risk * RR_RATIO
 
     else:
         stop_loss = zone["high"] + buffer
@@ -443,39 +475,24 @@ def calculate_entry(candles, zone, direction):
         if risk <= 0:
             return None
 
-        take_profit = entry - (risk * RR_RATIO)
+        take_profit = entry - risk * RR_RATIO
 
     return {
         "entry": entry,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "risk_distance": risk,
-        "rr": RR_RATIO,
-        "confirmation": reason
+        "rr": RR_RATIO
     }
 
 
 # ==========================================
-# SIGNAL CLASSIFICATION
-# ==========================================
-
-def classify_signal(h1, m15):
-    direction = m15["direction"]
-
-    if direction not in ("BULLISH", "BEARISH"):
-        return "NO VALID SETUP"
-
-    if h1["direction"] != direction:
-        return "NO VALID SETUP"
-
-    return "EARLY WARNING"
-
-
-# ==========================================
-# INSTRUMENT ANALYSIS
+# SIGNAL ANALYSIS
 # ==========================================
 
 def analyse_pair(symbol):
+    print(f"Analysing {symbol}", flush=True)
+
     h1_candles = get_candles(symbol, "1h")
 
     time.sleep(REQUEST_DELAY)
@@ -485,21 +502,47 @@ def analyse_pair(symbol):
     h1 = analyse_structure(h1_candles)
     m15 = analyse_structure(m15_candles)
 
-    signal = classify_signal(h1, m15)
     direction = m15["direction"]
+
+    aligned = (
+        direction in ("BULLISH", "BEARISH")
+        and h1["direction"] == direction
+    )
+
+    structural_trigger = False
+
+    if direction == "BULLISH":
+        structural_trigger = (
+            m15["bos"] == "BULLISH"
+            or m15["choch"] == "BULLISH"
+            or m15["sweep"] == "SELL-SIDE LIQUIDITY"
+        )
+
+    elif direction == "BEARISH":
+        structural_trigger = (
+            m15["bos"] == "BEARISH"
+            or m15["choch"] == "BEARISH"
+            or m15["sweep"] == "BUY-SIDE LIQUIDITY"
+        )
 
     fvg = None
     order_block = None
     selected_zone = None
     entry = None
-    rejection_reason = "No aligned directional setup"
 
-    if direction in ("BULLISH", "BEARISH"):
+    rejection_reason = "Waiting for directional alignment"
+
+    if not aligned:
+        status = "NO VALID SETUP"
+        action = "WAIT FOR H1 AND M15 ALIGNMENT"
+
+    else:
         fvg = find_valid_fvg(m15_candles, direction)
 
         order_block = find_valid_order_block(
             m15_candles,
-            direction
+            direction,
+            m15
         )
 
         candidates = [
@@ -508,70 +551,70 @@ def analyse_pair(symbol):
         ]
 
         if candidates:
-            # Prefer the most recently formed valid zone.
             selected_zone = max(
                 candidates,
                 key=lambda z: z["index"]
             )
 
-        if h1["direction"] == direction:
-            if selected_zone is None:
-                rejection_reason = "No valid FVG or Order Block"
+        if not structural_trigger:
+            status = "EARLY WARNING"
+            action = "WAIT FOR RECENT STRUCTURAL CONFIRMATION"
+            rejection_reason = "No recent aligned BOS, CHOCH or liquidity sweep"
 
-            else:
-                confirmed, rejection_reason = check_retest(
+        elif selected_zone is None:
+            status = "STRUCTURAL SETUP - NO FRESH ZONE"
+            action = "WAIT FOR A NEW VALID FVG OR ORDER BLOCK"
+            rejection_reason = "No fresh, unmitigated zone found"
+
+        else:
+            confirmed, rejection_reason = check_retest(
+                m15_candles,
+                selected_zone,
+                direction
+            )
+
+            if confirmed:
+                entry = calculate_entry(
                     m15_candles,
                     selected_zone,
                     direction
                 )
 
-                if confirmed:
-                    entry = calculate_entry(
-                        m15_candles,
-                        selected_zone,
-                        direction
-                    )
+            if entry:
+                status = "ENTRY CONDITIONS MET - ALERT ONLY"
+                action = "REVIEW RISK BEFORE ANY TRADE"
+            else:
+                status = "STRUCTURAL SETUP - WAIT"
+                action = "WAIT FOR M15 RETEST AND REJECTION"
 
-    if entry:
-        status = "ENTRY CONDITIONS MET - ALERT ONLY"
-        action = "REVIEW RISK AND EXECUTION CONDITIONS"
-
-    elif signal == "EARLY WARNING":
-        status = "EARLY WARNING"
-        action = "WAIT FOR VALID ZONE RETEST AND REJECTION"
-
-    else:
-        status = "NO VALID SETUP"
-        action = "WAIT"
-
-    def format_price(value):
-        if value is None:
-            return "NONE"
-        return f"{value:.5f}"
+    def fmt(value):
+        return "NONE" if value is None else f"{value:.5f}"
 
     def zone_text(zone):
         if zone is None:
             return "NONE"
 
-        mitigation = "MITIGATED" if zone["mitigated"] else "UNMITIGATED"
+        state = (
+            "RETESTING NOW"
+            if zone["retested_now"]
+            else "FRESH / UNTOUCHED"
+        )
 
         return (
             f"{zone['type']} "
-            f"{format_price(zone['low'])} - "
-            f"{format_price(zone['high'])} "
-            f"({mitigation})"
+            f"{fmt(zone['low'])} - {fmt(zone['high'])} "
+            f"({state})"
         )
 
     entry_text = "NOT CONFIRMED"
 
     if entry:
         entry_text = (
-            f"ENTRY: {format_price(entry['entry'])}\n"
-            f"STOP LOSS: {format_price(entry['stop_loss'])}\n"
-            f"TAKE PROFIT: {format_price(entry['take_profit'])}\n"
-            f"RISK DISTANCE: {format_price(entry['risk_distance'])}\n"
-            f"RISK/REWARD: 1:{entry['rr']:.1f}\n"
-            f"CONFIRMATION: {entry['confirmation']}"
+            f"ENTRY: {fmt(entry['entry'])}\n"
+            f"STOP LOSS: {fmt(entry['stop_loss'])}\n"
+            f"TAKE PROFIT: {fmt(entry['take_profit'])}\n"
+            f"RISK DISTANCE: {fmt(entry['risk_distance'])}\n"
+            f"RISK/REWARD: 1:{entry['rr']:.1f}"
         )
 
     return (
@@ -583,21 +626,22 @@ def analyse_pair(symbol):
         f"M15 DIRECTION: {m15['direction']}\n"
         f"BOS: {m15['bos']}\n"
         f"CHOCH: {m15['choch']}\n"
-        f"LIQUIDITY: {m15['sweep']}\n\n"
+        f"LIQUIDITY: {m15['sweep']}\n"
+        f"RECENT BREAK: {m15['break_type']}\n\n"
         f"FVG: {zone_text(fvg)}\n"
         f"ORDER BLOCK: {zone_text(order_block)}\n"
         f"SELECTED ZONE: {zone_text(selected_zone)}\n"
         f"REJECTION REASON: {rejection_reason}\n\n"
         f"{entry_text}\n\n"
-        f"SWING HIGH: {format_price(m15['swing_high'])}\n"
-        f"SWING LOW: {format_price(m15['swing_low'])}\n"
-        f"LAST CLOSED PRICE: {format_price(m15_candles[-1]['close'])}\n"
+        f"SWING HIGH: {fmt(m15['swing_high'])}\n"
+        f"SWING LOW: {fmt(m15['swing_low'])}\n"
+        f"LAST CLOSED PRICE: {fmt(m15_candles[-1]['close'])}\n"
         f"LAST CLOSED CANDLE: {m15_candles[-1]['datetime']}"
     )
 
 
 # ==========================================
-# TELEGRAM
+# TELEGRAM DELIVERY
 # ==========================================
 
 def send_telegram(message):
@@ -607,7 +651,10 @@ def send_telegram(message):
     if not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing Telegram chat ID")
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
 
     chunks = [
         message[i:i+4000]
@@ -639,22 +686,18 @@ def send_telegram(message):
 # ==========================================
 
 def main():
-    print("ODJ AI SMART TRADER V3 STARTED", flush=True)
+    print("ODJ AI SMART TRADER V4 STARTED", flush=True)
 
     report = [
-        "ODJ AI SMART TRADER V3",
-        "VALID FVG + ORDER BLOCK + ENTRY CONFIRMATION",
-        "RISK MANAGEMENT REPORT",
+        "ODJ AI SMART TRADER V4",
+        "PRECISION FILTER REPORT",
+        "H1 ALIGNMENT + FRESH ZONES + M15 CONFIRMATION",
         "--------------------------------"
     ]
 
     for symbol in SYMBOLS:
         try:
-            print(f"Analysing {symbol}", flush=True)
-
-            result = analyse_pair(symbol)
-            report.append(result)
-
+            report.append(analyse_pair(symbol))
             print(f"Completed: {symbol}", flush=True)
 
         except Exception as error:
@@ -678,7 +721,7 @@ def main():
     print(final_report, flush=True)
     send_telegram(final_report)
 
-    print("ODJ AI SMART TRADER V3 FINISHED", flush=True)
+    print("ODJ AI SMART TRADER V4 FINISHED", flush=True)
 
 
 if __name__ == "__main__":

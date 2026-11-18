@@ -264,10 +264,20 @@ def main():
     successful = 0
     failed = 0
 
-    intervals = ["15min"]
+    intervals = [
+        interval.strip()
+        for interval in os.getenv(
+            "SCAN_INTERVALS", "15min"
+        ).split(",")
+        if interval.strip() in ("15min", "1h")
+    ]
 
-    if now.minute < 15:
-        intervals.append("1h")
+    if not intervals:
+        raise RuntimeError("No valid scan interval configured.")
+
+    results.append(
+        f"Timeframes scanned: {', '.join(intervals)}"
+    )
 
     for symbol in SYMBOLS:
         for interval in intervals:

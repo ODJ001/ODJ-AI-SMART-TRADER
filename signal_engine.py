@@ -5,7 +5,7 @@ import requests
 from datetime import datetime, timezone
 
 # ==========================================
-# ODJ AI SMART TRADER
+# ODJ AI SMART TRADER V3
 # ==========================================
 
 API_KEY = os.getenv("TWELVE_DATA_API_KEY")
@@ -18,6 +18,9 @@ SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
 CANDLE_LIMIT = 100
 REQUEST_DELAY = 9
 RR_RATIO = 2.0
+ATR_PERIOD = 14
+ZONE_LOOKBACK = 40
+OB_LOOKBACK = 30
 
 session = requests.Session()
 
@@ -62,7 +65,7 @@ def get_candles(symbol, interval):
             "close": float(item["close"])
         })
 
-    if len(candles) < 25:
+    if len(candles) < 30:
         raise RuntimeError("Insufficient candle history")
 
     # Exclude the currently forming candle
@@ -80,22 +83,18 @@ def find_swings(candles, left=2, right=2):
     for i in range(left, len(candles) - right):
         current = candles[i]
 
-        left_candles = candles[i-left:i]
-        right_candles = candles[i+1:i+right+1]
+        surrounding = (
+            candles[i-left:i] +
+            candles[i+1:i+right+1]
+        )
 
-        if all(
-            current["high"] > c["high"]
-            for c in left_candles + right_candles
-        ):
+        if all(current["high"] > c["high"] for c in surrounding):
             highs.append({
                 "index": i,
                 "price": current["high"]
             })
 
-        if all(
-            current["low"] < c["low"]
-            for c in left_candles + right_candles
-        ):
+        if all(current["low"] < c["low"] for c in surrounding):
             lows.append({
                 "index": i,
                 "price": current["low"]
@@ -112,7 +111,7 @@ def analyse_structure(candles):
     highs, lows = find_swings(candles)
 
     result = {
-        "direction": "UNCLEAR",
+        "direction": "RANGING",
         "bos": "NONE",
         "choch": "NONE",
         "sweep": "NONE",
@@ -122,7 +121,6 @@ def analyse_structure(candles):
     }
 
     if len(highs) < 2 or len(lows) < 2:
-        result["direction"] = "RANGING"
         return result
 
     latest = candles[-1]
@@ -144,7 +142,6 @@ def analyse_structure(candles):
 
     if higher_high and higher_low:
         previous_trend = "BULLISH"
-
     elif lower_high and lower_low:
         previous_trend = "BEARISH"
 
@@ -178,96 +175,20 @@ def analyse_structure(candles):
         else:
             result["bos"] = "BEARISH"
 
-    # Liquidity sweeps
-    if (
-        latest["low"] < swing_low
-        and latest["close"] > swing_low
-    ):
+    if latest["low"] < swing_low and latest["close"] > swing_low:
         result["sweep"] = "SELL-SIDE LIQUIDITY"
 
-    elif (
-        latest["high"] > swing_high
-        and latest["close"] < swing_high
-    ):
+    elif latest["high"] > swing_high and latest["close"] < swing_high:
         result["sweep"] = "BUY-SIDE LIQUIDITY"
 
     return result
 
 
 # ==========================================
-# FAIR VALUE GAP DETECTION
+# ATR
 # ==========================================
 
-def find_fvg(candles, direction):
-    zones = []
-
-    start = max(2, len(candles) - 30)
-
-    for i in range(start, len(candles)):
-        first = candles[i-2]
-        third = candles[i]
-
-        if direction == "BULLISH":
-            if third["low"] > first["high"]:
-                zones.append({
-                    "type": "BULLISH FVG",
-                    "low": first["high"],
-                    "high": third["low"],
-                    "index": i
-                })
-
-        elif direction == "BEARISH":
-            if third["high"] < first["low"]:
-                zones.append({
-                    "type": "BEARISH FVG",
-                    "low": third["high"],
-                    "high": first["low"],
-                    "index": i
-                })
-
-    return zones[-1] if zones else None
-
-
-# ==========================================
-# ORDER BLOCK DETECTION
-# ==========================================
-
-def find_order_block(candles, structure):
-    direction = structure["direction"]
-    break_index = structure["break_index"]
-
-    if break_index is None:
-        return None
-
-    start = max(0, break_index - 8)
-
-    for i in range(break_index - 1, start - 1, -1):
-        candle = candles[i]
-
-        if direction == "BULLISH" and candle["close"] < candle["open"]:
-            return {
-                "type": "BULLISH ORDER BLOCK",
-                "low": candle["low"],
-                "high": candle["high"],
-                "index": i
-            }
-
-        if direction == "BEARISH" and candle["close"] > candle["open"]:
-            return {
-                "type": "BEARISH ORDER BLOCK",
-                "low": candle["low"],
-                "high": candle["high"],
-                "index": i
-            }
-
-    return None
-
-
-# ==========================================
-# ATR CALCULATION
-# ==========================================
-
-def calculate_atr(candles, period=14):
+def calculate_atr(candles, period=ATR_PERIOD):
     ranges = []
 
     for i in range(1, len(candles)):
@@ -289,84 +210,225 @@ def calculate_atr(candles, period=14):
 
 
 # ==========================================
-# SIGNAL CLASSIFICATION
+# VALID FVG DETECTION
 # ==========================================
 
-def classify_signal(h1, m15):
-    direction = m15["direction"]
+def find_valid_fvg(candles, direction):
+    zones = []
+    start = max(2, len(candles) - ZONE_LOOKBACK)
 
-    aligned = (
-        direction in ("BULLISH", "BEARISH")
-        and h1["direction"] == direction
+    for i in range(start, len(candles)):
+        first = candles[i-2]
+        third = candles[i]
+
+        zone = None
+
+        if direction == "BULLISH" and third["low"] > first["high"]:
+            zone = {
+                "type": "BULLISH FVG",
+                "low": first["high"],
+                "high": third["low"],
+                "index": i
+            }
+
+        elif direction == "BEARISH" and third["high"] < first["low"]:
+            zone = {
+                "type": "BEARISH FVG",
+                "low": third["high"],
+                "high": first["low"],
+                "index": i
+            }
+
+        if zone is None:
+            continue
+
+        later_candles = candles[i+1:]
+
+        if direction == "BULLISH":
+            invalidated = any(
+                c["close"] < zone["low"]
+                for c in later_candles
+            )
+        else:
+            invalidated = any(
+                c["close"] > zone["high"]
+                for c in later_candles
+            )
+
+        if invalidated:
+            continue
+
+        # Track whether price has already entered the zone.
+        zone["mitigated"] = any(
+            c["low"] <= zone["high"]
+            and c["high"] >= zone["low"]
+            for c in later_candles
+        )
+
+        zones.append(zone)
+
+    return zones[-1] if zones else None
+
+
+# ==========================================
+# HISTORICAL ORDER BLOCK DETECTION
+# ==========================================
+
+def find_valid_order_block(candles, direction):
+    start = max(20, len(candles) - OB_LOOKBACK)
+
+    for break_index in range(len(candles) - 1, start - 1, -1):
+        history = candles[:break_index]
+
+        highs, lows = find_swings(history)
+
+        if not highs or not lows:
+            continue
+
+        previous = candles[break_index - 1]
+        current = candles[break_index]
+
+        bullish_break = (
+            previous["close"] <= highs[-1]["price"]
+            and current["close"] > highs[-1]["price"]
+        )
+
+        bearish_break = (
+            previous["close"] >= lows[-1]["price"]
+            and current["close"] < lows[-1]["price"]
+        )
+
+        if direction == "BULLISH" and not bullish_break:
+            continue
+
+        if direction == "BEARISH" and not bearish_break:
+            continue
+
+        search_start = max(0, break_index - 8)
+
+        for i in range(break_index - 1, search_start - 1, -1):
+            candle = candles[i]
+
+            if direction == "BULLISH" and candle["close"] < candle["open"]:
+                zone = {
+                    "type": "BULLISH ORDER BLOCK",
+                    "low": candle["low"],
+                    "high": candle["high"],
+                    "index": i
+                }
+
+            elif direction == "BEARISH" and candle["close"] > candle["open"]:
+                zone = {
+                    "type": "BEARISH ORDER BLOCK",
+                    "low": candle["low"],
+                    "high": candle["high"],
+                    "index": i
+                }
+
+            else:
+                continue
+
+            later_candles = candles[i+1:]
+
+            if direction == "BULLISH":
+                invalidated = any(
+                    c["close"] < zone["low"]
+                    for c in later_candles
+                )
+            else:
+                invalidated = any(
+                    c["close"] > zone["high"]
+                    for c in later_candles
+                )
+
+            if invalidated:
+                continue
+
+            zone["mitigated"] = any(
+                c["low"] <= zone["high"]
+                and c["high"] >= zone["low"]
+                for c in later_candles
+            )
+
+            return zone
+
+    return None
+
+
+# ==========================================
+# M15 RETEST AND REJECTION
+# ==========================================
+
+def check_retest(candles, zone, direction):
+    if zone is None:
+        return False, "No valid zone found"
+
+    candle = candles[-1]
+
+    overlap = (
+        candle["low"] <= zone["high"]
+        and candle["high"] >= zone["low"]
     )
 
-    if not aligned:
-        return {
-            "status": "NO VALID SETUP",
-            "direction": direction
-        }
+    if not overlap:
+        return False, "Price has not revisited the zone"
+
+    body = abs(candle["close"] - candle["open"])
+
+    if body == 0:
+        return False, "Confirmation candle has no body"
+
+    midpoint = (zone["low"] + zone["high"]) / 2
+
+    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+    upper_wick = candle["high"] - max(candle["open"], candle["close"])
 
     if direction == "BULLISH":
-        trigger = (
-            m15["bos"] == "BULLISH"
-            or m15["choch"] == "BULLISH"
-            or m15["sweep"] == "SELL-SIDE LIQUIDITY"
+        confirmed = (
+            candle["close"] > candle["open"]
+            and candle["close"] >= midpoint
+            and lower_wick >= body * 0.5
         )
+
+        if not confirmed:
+            return False, "Bullish rejection candle not confirmed"
 
     else:
-        trigger = (
-            m15["bos"] == "BEARISH"
-            or m15["choch"] == "BEARISH"
-            or m15["sweep"] == "BUY-SIDE LIQUIDITY"
+        confirmed = (
+            candle["close"] < candle["open"]
+            and candle["close"] <= midpoint
+            and upper_wick >= body * 0.5
         )
 
-    if trigger:
-        return {
-            "status": "CONFIRMED STRUCTURAL SETUP",
-            "direction": direction
-        }
+        if not confirmed:
+            return False, "Bearish rejection candle not confirmed"
 
-    return {
-        "status": "EARLY WARNING",
-        "direction": direction
-    }
+    return True, "Directional M15 rejection confirmed"
 
 
 # ==========================================
-# ENTRY AND RISK CALCULATION
+# ENTRY AND RISK MANAGEMENT
 # ==========================================
 
-def calculate_entry(candles, direction, zone):
-    if not zone:
+def calculate_entry(candles, zone, direction):
+    if zone is None:
         return None
 
     atr = calculate_atr(candles)
 
-    if atr is None:
+    if atr is None or atr <= 0:
         return None
 
-    last = candles[-1]
+    confirmed, reason = check_retest(candles, zone, direction)
 
-    # Price must revisit the candidate zone
-    overlap = (
-        last["low"] <= zone["high"]
-        and last["high"] >= zone["low"]
-    )
-
-    if not overlap:
+    if not confirmed:
         return None
 
-    entry = last["close"]
-
-    # Require a directional candle closing within the zone
-    if not (zone["low"] <= entry <= zone["high"]):
-        return None
+    entry = candles[-1]["close"]
+    buffer = atr * 0.2
 
     if direction == "BULLISH":
-        if last["close"] <= last["open"]:
-            return None
-
-        stop_loss = zone["low"] - (0.2 * atr)
+        stop_loss = zone["low"] - buffer
         risk = entry - stop_loss
 
         if risk <= 0:
@@ -375,10 +437,7 @@ def calculate_entry(candles, direction, zone):
         take_profit = entry + (risk * RR_RATIO)
 
     else:
-        if last["close"] >= last["open"]:
-            return None
-
-        stop_loss = zone["high"] + (0.2 * atr)
+        stop_loss = zone["high"] + buffer
         risk = stop_loss - entry
 
         if risk <= 0:
@@ -391,17 +450,32 @@ def calculate_entry(candles, direction, zone):
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "risk_distance": risk,
-        "rr": RR_RATIO
+        "rr": RR_RATIO,
+        "confirmation": reason
     }
 
 
 # ==========================================
-# FULL INSTRUMENT ANALYSIS
+# SIGNAL CLASSIFICATION
+# ==========================================
+
+def classify_signal(h1, m15):
+    direction = m15["direction"]
+
+    if direction not in ("BULLISH", "BEARISH"):
+        return "NO VALID SETUP"
+
+    if h1["direction"] != direction:
+        return "NO VALID SETUP"
+
+    return "EARLY WARNING"
+
+
+# ==========================================
+# INSTRUMENT ANALYSIS
 # ==========================================
 
 def analyse_pair(symbol):
-    print(f"Analysing {symbol}", flush=True)
-
     h1_candles = get_candles(symbol, "1h")
 
     time.sleep(REQUEST_DELAY)
@@ -412,70 +486,92 @@ def analyse_pair(symbol):
     m15 = analyse_structure(m15_candles)
 
     signal = classify_signal(h1, m15)
-
-    direction = signal["direction"]
+    direction = m15["direction"]
 
     fvg = None
     order_block = None
     selected_zone = None
     entry = None
+    rejection_reason = "No aligned directional setup"
 
     if direction in ("BULLISH", "BEARISH"):
-        fvg = find_fvg(m15_candles, direction)
-        order_block = find_order_block(m15_candles, m15)
+        fvg = find_valid_fvg(m15_candles, direction)
+
+        order_block = find_valid_order_block(
+            m15_candles,
+            direction
+        )
 
         candidates = [
-            zone for zone in [fvg, order_block]
-            if zone is not None
+            z for z in [fvg, order_block]
+            if z is not None
         ]
 
         if candidates:
+            # Prefer the most recently formed valid zone.
             selected_zone = max(
                 candidates,
-                key=lambda zone: zone["index"]
+                key=lambda z: z["index"]
             )
 
-        if signal["status"] == "CONFIRMED STRUCTURAL SETUP":
-            entry = calculate_entry(
-                m15_candles,
-                direction,
-                selected_zone
-            )
+        if h1["direction"] == direction:
+            if selected_zone is None:
+                rejection_reason = "No valid FVG or Order Block"
+
+            else:
+                confirmed, rejection_reason = check_retest(
+                    m15_candles,
+                    selected_zone,
+                    direction
+                )
+
+                if confirmed:
+                    entry = calculate_entry(
+                        m15_candles,
+                        selected_zone,
+                        direction
+                    )
 
     if entry:
         status = "ENTRY CONDITIONS MET - ALERT ONLY"
-        action = "REVIEW SETUP AND RISK BEFORE TRADING"
+        action = "REVIEW RISK AND EXECUTION CONDITIONS"
 
-    elif signal["status"] == "CONFIRMED STRUCTURAL SETUP":
-        status = "CONFIRMED STRUCTURAL SETUP"
-        action = "WAIT FOR FVG OR ORDER BLOCK RETEST"
-
-    elif signal["status"] == "EARLY WARNING":
+    elif signal == "EARLY WARNING":
         status = "EARLY WARNING"
-        action = "WATCH FOR STRUCTURAL CONFIRMATION"
+        action = "WAIT FOR VALID ZONE RETEST AND REJECTION"
 
     else:
         status = "NO VALID SETUP"
         action = "WAIT"
 
-    zone_text = "NONE"
+    def format_price(value):
+        if value is None:
+            return "NONE"
+        return f"{value:.5f}"
 
-    if selected_zone:
-        zone_text = (
-            f"{selected_zone['type']}: "
-            f"{selected_zone['low']:.5f} - "
-            f"{selected_zone['high']:.5f}"
+    def zone_text(zone):
+        if zone is None:
+            return "NONE"
+
+        mitigation = "MITIGATED" if zone["mitigated"] else "UNMITIGATED"
+
+        return (
+            f"{zone['type']} "
+            f"{format_price(zone['low'])} - "
+            f"{format_price(zone['high'])} "
+            f"({mitigation})"
         )
 
     entry_text = "NOT CONFIRMED"
 
     if entry:
         entry_text = (
-            f"ENTRY: {entry['entry']:.5f}\n"
-            f"STOP LOSS: {entry['stop_loss']:.5f}\n"
-            f"TAKE PROFIT: {entry['take_profit']:.5f}\n"
-            f"RISK DISTANCE: {entry['risk_distance']:.5f}\n"
-            f"RISK/REWARD: 1:{entry['rr']:.1f}"
+            f"ENTRY: {format_price(entry['entry'])}\n"
+            f"STOP LOSS: {format_price(entry['stop_loss'])}\n"
+            f"TAKE PROFIT: {format_price(entry['take_profit'])}\n"
+            f"RISK DISTANCE: {format_price(entry['risk_distance'])}\n"
+            f"RISK/REWARD: 1:{entry['rr']:.1f}\n"
+            f"CONFIRMATION: {entry['confirmation']}"
         )
 
     return (
@@ -488,14 +584,14 @@ def analyse_pair(symbol):
         f"BOS: {m15['bos']}\n"
         f"CHOCH: {m15['choch']}\n"
         f"LIQUIDITY: {m15['sweep']}\n\n"
-        f"FVG: {fvg['type'] if fvg else 'NONE'}\n"
-        f"ORDER BLOCK: "
-        f"{order_block['type'] if order_block else 'NONE'}\n"
-        f"SELECTED ZONE: {zone_text}\n\n"
+        f"FVG: {zone_text(fvg)}\n"
+        f"ORDER BLOCK: {zone_text(order_block)}\n"
+        f"SELECTED ZONE: {zone_text(selected_zone)}\n"
+        f"REJECTION REASON: {rejection_reason}\n\n"
         f"{entry_text}\n\n"
-        f"SWING HIGH: {m15['swing_high']}\n"
-        f"SWING LOW: {m15['swing_low']}\n"
-        f"LAST CLOSED PRICE: {m15_candles[-1]['close']}\n"
+        f"SWING HIGH: {format_price(m15['swing_high'])}\n"
+        f"SWING LOW: {format_price(m15['swing_low'])}\n"
+        f"LAST CLOSED PRICE: {format_price(m15_candles[-1]['close'])}\n"
         f"LAST CLOSED CANDLE: {m15_candles[-1]['datetime']}"
     )
 
@@ -511,10 +607,7 @@ def send_telegram(message):
     if not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing Telegram chat ID")
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     chunks = [
         message[i:i+4000]
@@ -542,21 +635,23 @@ def send_telegram(message):
 
 
 # ==========================================
-# MAIN ENGINE
+# MAIN
 # ==========================================
 
 def main():
-    print("ODJ AI SMART TRADER STARTED", flush=True)
+    print("ODJ AI SMART TRADER V3 STARTED", flush=True)
 
     report = [
-        "ODJ AI SMART TRADER",
-        "ADVANCED MARKET STRUCTURE REPORT",
-        "FVG + ORDER BLOCK + RISK ANALYSIS",
+        "ODJ AI SMART TRADER V3",
+        "VALID FVG + ORDER BLOCK + ENTRY CONFIRMATION",
+        "RISK MANAGEMENT REPORT",
         "--------------------------------"
     ]
 
     for symbol in SYMBOLS:
         try:
+            print(f"Analysing {symbol}", flush=True)
+
             result = analyse_pair(symbol)
             report.append(result)
 
@@ -576,17 +671,14 @@ def main():
     final_report = (
         "\n\n".join(report)
         + "\n\nREPORT TIME: "
-        + datetime.now(timezone.utc).strftime(
-            "%Y-%m-%d %H:%M UTC"
-        )
+        + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         + "\n\nALERT ONLY - NO AUTOMATIC TRADING"
     )
 
     print(final_report, flush=True)
-
     send_telegram(final_report)
 
-    print("ODJ AI SMART TRADER FINISHED", flush=True)
+    print("ODJ AI SMART TRADER V3 FINISHED", flush=True)
 
 
 if __name__ == "__main__":

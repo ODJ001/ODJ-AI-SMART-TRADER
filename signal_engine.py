@@ -1,18 +1,33 @@
 
 import os
 import time
+import json
+import base64
 import requests
+
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
 # ============================================================
-# ODJ AI SMART TRADER V9
+# ODJ AI SMART TRADER V10
 # STRICT ENTRY VALIDATION | ALERT ONLY
 # ============================================================
 
-API_KEY = os.getenv("TWELVE_DATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
+VERSION = "V10"
+
+API_KEY = (
+    os.getenv("TWELVE_DATA_API_KEY")
+    or os.getenv("TWELVEDATA_API_KEY")
+)
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Optional GitHub token for persistent duplicate-alert protection.
+GH_ALERT_TOKEN = os.getenv("GH_ALERT_TOKEN")
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
+
+STATE_FILE = ".odj_alert_state.json"
 
 BASE_URL = "https://api.twelvedata.com/time_series"
 
@@ -31,6 +46,13 @@ MAX_ZONE_DISTANCE_ATR = 2.5
 MIN_ZONE_QUALITY = 45
 MIN_ENTRY_SCORE = 80
 
+# V10 corrections
+MAX_SWEEP_AGE = 4
+NEARBY_LIQUIDITY_ATR = 3.0
+
+ALERT_STATE_DAYS = 30
+MAX_STORED_ALERTS = 100
+
 
 # ============================================================
 # DATA FETCHING
@@ -38,10 +60,15 @@ MIN_ENTRY_SCORE = 80
 
 def parse_time(value):
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+
         return dt.astimezone(timezone.utc)
+
     except Exception:
         return None
 
@@ -63,8 +90,8 @@ def fetch_candles(symbol, timeframe):
         },
         timeout=25,
     )
-    response.raise_for_status()
 
+    response.raise_for_status()
     data = response.json()
 
     if "values" not in data:
@@ -72,14 +99,16 @@ def fetch_candles(symbol, timeframe):
 
     now = datetime.now(timezone.utc)
     duration = timedelta(minutes=settings["minutes"])
+
     candles = []
 
     for item in data["values"]:
         timestamp = parse_time(item.get("datetime"))
+
         if timestamp is None:
             continue
 
-        # Only use candles whose full duration has elapsed.
+        # Only completed candles are used.
         if timestamp + duration > now:
             continue
 
@@ -91,6 +120,7 @@ def fetch_candles(symbol, timeframe):
                 "low": float(item["low"]),
                 "close": float(item["close"]),
             })
+
         except (ValueError, TypeError, KeyError):
             continue
 
@@ -140,14 +170,20 @@ def find_swings(candles, left=2, right=2):
             for j in range(i-left, i+right+1)
             if j != i
         ):
-            highs.append({"index": i, "price": high})
+            highs.append({
+                "index": i,
+                "price": high,
+            })
 
         if all(
             low < candles[j]["low"]
             for j in range(i-left, i+right+1)
             if j != i
         ):
-            lows.append({"index": i, "price": low})
+            lows.append({
+                "index": i,
+                "price": low,
+            })
 
     return highs, lows
 
@@ -172,7 +208,7 @@ def determine_trend(highs, lows):
 
 
 # ============================================================
-# STRUCTURE: BOS / CHOCH
+# MARKET STRUCTURE: BOS / CHOCH
 # ============================================================
 
 def analyse_structure(candles):
@@ -190,10 +226,9 @@ def analyse_structure(candles):
         "lows": lows,
     }
 
-    if len(highs) < 1 or len(lows) < 1:
+    if not highs or not lows:
         return result
 
-    # Examine recent completed candles for a fresh break.
     start = max(2, len(candles) - 9)
 
     for i in range(start, len(candles)):
@@ -203,6 +238,7 @@ def analyse_structure(candles):
         prior_highs = [
             x["price"] for x in highs if x["index"] < i
         ]
+
         prior_lows = [
             x["price"] for x in lows if x["index"] < i
         ]
@@ -228,10 +264,18 @@ def analyse_structure(candles):
 
             if trend == "BEARISH":
                 result["choch"] = "BULLISH"
+                result["bos"] = "NONE"
+                result["range_break"] = "NONE"
+
             elif trend == "RANGING":
                 result["range_break"] = "BULLISH"
+                result["bos"] = "NONE"
+                result["choch"] = "NONE"
+
             else:
                 result["bos"] = "BULLISH"
+                result["choch"] = "NONE"
+                result["range_break"] = "NONE"
 
         elif bearish_break:
             result["event_index"] = i
@@ -239,10 +283,18 @@ def analyse_structure(candles):
 
             if trend == "BULLISH":
                 result["choch"] = "BEARISH"
+                result["bos"] = "NONE"
+                result["range_break"] = "NONE"
+
             elif trend == "RANGING":
                 result["range_break"] = "BEARISH"
+                result["bos"] = "NONE"
+                result["choch"] = "NONE"
+
             else:
                 result["bos"] = "BEARISH"
+                result["choch"] = "NONE"
+                result["range_break"] = "NONE"
 
     return result
 
@@ -273,7 +325,9 @@ def cluster_levels(levels, tolerance):
             groups.append([level])
             continue
 
-        center = median([x["price"] for x in groups[-1]])
+        center = median([
+            x["price"] for x in groups[-1]
+        ])
 
         if abs(level["price"] - center) <= tolerance:
             groups[-1].append(level)
@@ -285,6 +339,7 @@ def cluster_levels(levels, tolerance):
     for group in groups:
         if len(group) >= 2:
             prices = [x["price"] for x in group]
+
             output.append({
                 "price": median(prices),
                 "touches": len(group),
@@ -297,17 +352,41 @@ def cluster_levels(levels, tolerance):
 
 def detect_liquidity(candles, atr):
     highs, lows = find_swings(candles)
+
     tolerance = max(atr * 0.12, 0.00001)
+    price = candles[-1]["close"]
 
     buy = cluster_levels(highs, tolerance)
     sell = cluster_levels(lows, tolerance)
 
-    price = candles[-1]["close"]
+    # Separate nearby levels from distant levels.
+    def separate(levels):
+        nearby = []
+        distant = []
 
-    buy.sort(key=lambda x: abs(x["price"] - price))
-    sell.sort(key=lambda x: abs(x["price"] - price))
+        for level in levels:
+            distance = (
+                abs(level["price"] - price) / atr
+                if atr > 0 else float("inf")
+            )
 
-    return buy[:3], sell[:3]
+            item = dict(level)
+            item["distance_atr"] = distance
+
+            if distance <= NEARBY_LIQUIDITY_ATR:
+                nearby.append(item)
+            else:
+                distant.append(item)
+
+        nearby.sort(key=lambda x: x["distance_atr"])
+        distant.sort(key=lambda x: x["distance_atr"])
+
+        return nearby[:3], distant[:3]
+
+    buy_near, buy_far = separate(buy)
+    sell_near, sell_far = separate(sell)
+
+    return buy_near, buy_far, sell_near, sell_far
 
 
 # ============================================================
@@ -322,8 +401,6 @@ def detect_fvg(candles, atr):
 
     current_price = candles[-1]["close"]
 
-    # The last candle cannot create a usable zone by itself:
-    # a later completed candle must be available for retesting.
     for i in range(2, len(candles) - 1):
         age = len(candles) - 1 - i
 
@@ -356,13 +433,15 @@ def detect_fvg(candles, atr):
         if gap_atr < 0.08:
             continue
 
-        # Reject any zone touched after formation.
-        mitigated = any(
+        # A previous retest invalidates the fresh zone.
+        # The latest candle is excluded here because it may
+        # be the first valid retest/rejection candle.
+        previously_mitigated = any(
             candle["low"] <= high and candle["high"] >= low
-            for candle in candles[i + 1:]
+            for candle in candles[i + 1:-1]
         )
 
-        if mitigated:
+        if previously_mitigated:
             continue
 
         distance_score = max(0, 35 - distance * 12)
@@ -409,9 +488,11 @@ def detect_order_block(candles, structure, atr):
         candle = candles[i]
 
         opposing = (
-            direction == "BULLISH" and candle["close"] < candle["open"]
+            direction == "BULLISH"
+            and candle["close"] < candle["open"]
         ) or (
-            direction == "BEARISH" and candle["close"] > candle["open"]
+            direction == "BEARISH"
+            and candle["close"] > candle["open"]
         )
 
         if not opposing:
@@ -420,6 +501,7 @@ def detect_order_block(candles, structure, atr):
         low = candle["low"]
         high = candle["high"]
         midpoint = (low + high) / 2
+
         distance = abs(current_price - midpoint) / atr
         age = len(candles) - 1 - i
 
@@ -429,15 +511,19 @@ def detect_order_block(candles, structure, atr):
         if distance > MAX_ZONE_DISTANCE_ATR:
             continue
 
-        mitigated = any(
+        # Allow the current candle to be the first retest.
+        previously_mitigated = any(
             x["low"] <= high and x["high"] >= low
-            for x in candles[i + 1:]
+            for x in candles[i + 1:-1]
         )
 
-        if mitigated:
+        if previously_mitigated:
             continue
 
-        quality = int(max(0, 80 - distance * 15 - age))
+        quality = int(max(
+            0,
+            80 - distance * 15 - age
+        ))
 
         if quality < MIN_ZONE_QUALITY:
             continue
@@ -461,6 +547,7 @@ def select_zone(candles, structure, atr):
     zones = detect_fvg(candles, atr)
 
     ob = detect_order_block(candles, structure, atr)
+
     if ob:
         zones.append(ob)
 
@@ -480,7 +567,7 @@ def select_zone(candles, structure, atr):
 
 
 # ============================================================
-# REAL RETEST AND REJECTION VALIDATION
+# RETEST AND REJECTION VALIDATION
 # ============================================================
 
 def validate_retest_rejection(candles, zone):
@@ -494,7 +581,6 @@ def validate_retest_rejection(candles, zone):
     zone_index = zone["index"]
     current_index = len(candles) - 1
 
-    # A later candle must exist after the zone was created.
     if current_index <= zone_index:
         return {
             "retest": False,
@@ -504,7 +590,6 @@ def validate_retest_rejection(candles, zone):
 
     later_candles = candles[zone_index + 1:]
 
-    # Price must actually return to the zone after formation.
     touched = [
         c for c in later_candles
         if c["low"] <= zone["high"]
@@ -528,13 +613,14 @@ def validate_retest_rejection(candles, zone):
             "valid": False,
         }
 
-    body_ratio = abs(last["close"] - last["open"]) / candle_range
+    body_ratio = (
+        abs(last["close"] - last["open"]) / candle_range
+    )
 
     close_position = (
         last["close"] - last["low"]
     ) / candle_range
 
-    # The current candle must be the retest rejection candle.
     current_touches = (
         last["low"] <= zone["high"]
         and last["high"] >= zone["low"]
@@ -548,7 +634,9 @@ def validate_retest_rejection(candles, zone):
         }
 
     if zone["direction"] == "BULLISH":
-        lower_wick = min(last["open"], last["close"]) - last["low"]
+        lower_wick = (
+            min(last["open"], last["close"]) - last["low"]
+        )
 
         rejection = (
             last["close"] > last["open"]
@@ -559,7 +647,9 @@ def validate_retest_rejection(candles, zone):
         )
 
     else:
-        upper_wick = last["high"] - max(last["open"], last["close"])
+        upper_wick = (
+            last["high"] - max(last["open"], last["close"])
+        )
 
         rejection = (
             last["close"] < last["open"]
@@ -577,24 +667,30 @@ def validate_retest_rejection(candles, zone):
 
 
 # ============================================================
-# CONFIRMED LIQUIDITY SWEEP
+# V10 CONFIRMED LIQUIDITY SWEEP
 # ============================================================
 
 def detect_confirmed_sweep(candles, structure):
     highs = structure["highs"]
     lows = structure["lows"]
 
-    start = max(3, len(candles) - 12)
+    latest_index = len(candles) - 1
 
-    for i in range(len(candles) - 2, start - 1, -1):
+    # Only inspect sweeps from the last four completed candles.
+    start = max(3, latest_index - MAX_SWEEP_AGE)
+
+    for i in range(latest_index - 1, start - 1, -1):
         candle = candles[i]
         follow = candles[i + 1]
 
         prior_highs = [
-            x["price"] for x in highs if x["index"] < i
+            x["price"] for x in highs
+            if x["index"] < i
         ]
+
         prior_lows = [
-            x["price"] for x in lows if x["index"] < i
+            x["price"] for x in lows
+            if x["index"] < i
         ]
 
         if prior_highs:
@@ -616,6 +712,7 @@ def detect_confirmed_sweep(candles, structure):
                     "direction": "BEARISH",
                     "level": level,
                     "index": i,
+                    "age": latest_index - i,
                     "confirmed": True,
                 }
 
@@ -638,6 +735,7 @@ def detect_confirmed_sweep(candles, structure):
                     "direction": "BULLISH",
                     "level": level,
                     "index": i,
+                    "age": latest_index - i,
                     "confirmed": True,
                 }
 
@@ -655,7 +753,11 @@ def calculate_levels(candles, zone, atr):
     entry = candles[-1]["close"]
 
     if zone["direction"] == "BULLISH":
-        stop = min(zone["low"], candles[-1]["low"]) - atr * 0.25
+        stop = min(
+            zone["low"],
+            candles[-1]["low"]
+        ) - atr * 0.25
+
         risk = entry - stop
 
         if risk <= 0:
@@ -664,7 +766,11 @@ def calculate_levels(candles, zone, atr):
         target = entry + risk * 2
 
     else:
-        stop = max(zone["high"], candles[-1]["high"]) + atr * 0.25
+        stop = max(
+            zone["high"],
+            candles[-1]["high"]
+        ) + atr * 0.25
+
         risk = stop - entry
 
         if risk <= 0:
@@ -694,7 +800,10 @@ def evaluate(symbol, h1, m15):
 
     retest = validate_retest_rejection(m15, zone)
 
-    sweep = detect_confirmed_sweep(m15, m15_structure)
+    sweep = detect_confirmed_sweep(
+        m15,
+        m15_structure
+    )
 
     h1_direction = h1_structure["direction"]
     m15_direction = m15_structure["direction"]
@@ -744,7 +853,6 @@ def evaluate(symbol, h1, m15):
     if sweep_confirmed:
         entry_score += 20
 
-    # Strict entry gate: every condition is mandatory.
     entry_valid = all([
         aligned,
         structure_confirmed,
@@ -772,7 +880,10 @@ def evaluate(symbol, h1, m15):
         watch_score += 15
 
     if zone:
-        watch_score += min(25, int(zone["quality"] * 0.25))
+        watch_score += min(
+            25,
+            int(zone["quality"] * 0.25)
+        )
 
     if sweep:
         watch_score += 10
@@ -785,16 +896,24 @@ def evaluate(symbol, h1, m15):
 
     if entry_valid:
         status = "CONFIRMED ENTRY CONDITIONS"
+
     elif watch_score >= 20:
         status = "WATCHLIST"
+
     else:
         status = "NO SETUP"
 
-    buy_liquidity, sell_liquidity = detect_liquidity(m15, atr)
+    (
+        buy_near,
+        buy_far,
+        sell_near,
+        sell_far,
+    ) = detect_liquidity(m15, atr)
 
     return {
         "symbol": symbol,
         "price": price,
+        "atr": atr,
         "status": status,
         "h1": h1_structure,
         "m15": m15_structure,
@@ -806,20 +925,27 @@ def evaluate(symbol, h1, m15):
         "entry_score": entry_score,
         "entry_valid": entry_valid,
         "levels": levels,
-        "buy_liquidity": buy_liquidity,
-        "sell_liquidity": sell_liquidity,
+        "buy_near": buy_near,
+        "buy_far": buy_far,
+        "sell_near": sell_near,
+        "sell_far": sell_far,
     }
 
 
 # ============================================================
-# REPORT
+# FORMATTING
 # ============================================================
 
 def fmt(value, symbol):
     if value is None:
         return "N/A"
 
-    digits = 3 if "JPY" in symbol else (2 if "XAU" in symbol else 5)
+    digits = (
+        3 if "JPY" in symbol
+        else 2 if "XAU" in symbol
+        else 5
+    )
+
     return f"{value:.{digits}f}"
 
 
@@ -828,7 +954,8 @@ def liquidity_text(levels, symbol):
         return "None"
 
     return ", ".join(
-        f"{fmt(x['price'], symbol)} ({x['touches']} touches)"
+        f"{fmt(x['price'], symbol)} "
+        f"({x['touches']} touches)"
         for x in levels
     )
 
@@ -857,36 +984,54 @@ def format_result(r):
     if zone:
         lines.append(
             f"Zone {zone['type']} {zone['direction']} "
-            f"{fmt(zone['low'], symbol)}–{fmt(zone['high'], symbol)} | "
+            f"{fmt(zone['low'], symbol)}–"
+            f"{fmt(zone['high'], symbol)} | "
             f"Quality {zone['quality']}/100 | "
-            f"Age {zone['age']} | Distance {zone['distance']:.2f} ATR"
+            f"Age {zone['age']} | "
+            f"Distance {zone['distance']:.2f} ATR"
         )
+
         lines.append(
             f"Retest: {'YES' if r['retest']['retest'] else 'NO'} | "
             f"Rejection: {'YES' if r['retest']['rejection'] else 'NO'}"
         )
+
     else:
         lines.append("Zone: No fresh qualifying zone")
 
     if sweep:
         lines.append(
-            f"Sweep: {sweep['type']} at {fmt(sweep['level'], symbol)} "
-            f"— CONFIRMED"
+            f"Sweep: {sweep['type']} at "
+            f"{fmt(sweep['level'], symbol)} "
+            f"— CONFIRMED | Age {sweep['age']} M15 candles"
         )
+
     else:
-        lines.append("Confirmed liquidity sweep: None")
+        lines.append("Confirmed fresh liquidity sweep: None")
 
     lines.append(
-        "Potential buy-side liquidity: "
-        + liquidity_text(r["buy_liquidity"], symbol)
+        "Nearby buy-side liquidity (within 3 ATR): "
+        + liquidity_text(r["buy_near"], symbol)
     )
+
     lines.append(
-        "Potential sell-side liquidity: "
-        + liquidity_text(r["sell_liquidity"], symbol)
+        "Distant buy-side liquidity (over 3 ATR): "
+        + liquidity_text(r["buy_far"], symbol)
+    )
+
+    lines.append(
+        "Nearby sell-side liquidity (within 3 ATR): "
+        + liquidity_text(r["sell_near"], symbol)
+    )
+
+    lines.append(
+        "Distant sell-side liquidity (over 3 ATR): "
+        + liquidity_text(r["sell_far"], symbol)
     )
 
     if r["entry_valid"] and r["levels"]:
         lv = r["levels"]
+
         lines.extend([
             "ENTRY CONDITIONS CONFIRMED — ALERT ONLY",
             f"Direction: {r['h1']['direction']}",
@@ -895,8 +1040,11 @@ def format_result(r):
             f"Take profit: {fmt(lv['target'], symbol)}",
             "Risk/reward reference: 1:2",
         ])
+
     else:
-        lines.append("No entry alert. Wait for every condition to confirm.")
+        lines.append(
+            "No entry alert. Wait for every condition to confirm."
+        )
 
     return "\n".join(lines)
 
@@ -909,7 +1057,10 @@ def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing Telegram configuration")
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{BOT_TOKEN}/sendMessage"
+    )
 
     response = requests.post(
         url,
@@ -926,7 +1077,9 @@ def send_telegram(message):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError(f"Telegram rejected message: {result}")
+        raise RuntimeError(
+            f"Telegram rejected message: {result}"
+        )
 
 
 def send_long_message(message):
@@ -935,7 +1088,9 @@ def send_long_message(message):
 
     for line in message.splitlines():
         if len(current) + len(line) + 1 > 3900:
-            chunks.append(current)
+            if current:
+                chunks.append(current)
+
             current = ""
 
         current += line + "\n"
@@ -945,6 +1100,202 @@ def send_long_message(message):
 
     for chunk in chunks:
         send_telegram(chunk)
+
+
+# ============================================================
+# V10 PERSISTENT DUPLICATE-ALERT PROTECTION
+# ============================================================
+
+def github_headers():
+    return {
+        "Authorization": f"Bearer {GH_ALERT_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_state_url():
+    if not GITHUB_REPOSITORY:
+        return None
+
+    return (
+        "https://api.github.com/repos/"
+        f"{GITHUB_REPOSITORY}/contents/{STATE_FILE}"
+    )
+
+
+def load_alert_state():
+    """
+    Returns:
+        state, sha, persistence_available
+
+    A missing state file is normal on the first run.
+    """
+
+    if not GH_ALERT_TOKEN or not GITHUB_REPOSITORY:
+        print(
+            "WARNING: GH_ALERT_TOKEN not configured. "
+            "Persistent duplicate protection is disabled."
+        )
+
+        return {}, None, False
+
+    try:
+        response = requests.get(
+            github_state_url(),
+            headers=github_headers(),
+            timeout=20,
+        )
+
+        if response.status_code == 404:
+            return {"alerts": {}}, None, True
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        raw = base64.b64decode(
+            data["content"].replace("\n", "")
+        ).decode("utf-8")
+
+        state = json.loads(raw)
+
+        if not isinstance(state, dict):
+            state = {}
+
+        if not isinstance(state.get("alerts"), dict):
+            state["alerts"] = {}
+
+        return state, data.get("sha"), True
+
+    except Exception as error:
+        print(
+            "WARNING: Could not load GitHub alert state: "
+            f"{error}"
+        )
+
+        return {}, None, False
+
+
+def save_alert_state(state, sha):
+    if not GH_ALERT_TOKEN or not GITHUB_REPOSITORY:
+        return False
+
+    try:
+        raw = json.dumps(
+            state,
+            indent=2,
+            sort_keys=True,
+        )
+
+        encoded = base64.b64encode(
+            raw.encode("utf-8")
+        ).decode("utf-8")
+
+        payload = {
+            "message": "Update ODJ Smart Trader alert state",
+            "content": encoded,
+        }
+
+        if sha:
+            payload["sha"] = sha
+
+        response = requests.put(
+            github_state_url(),
+            headers=github_headers(),
+            json=payload,
+            timeout=25,
+        )
+
+        response.raise_for_status()
+
+        print("Persistent alert state saved to GitHub.")
+        return True
+
+    except Exception as error:
+        print(
+            "WARNING: Could not save GitHub alert state: "
+            f"{error}"
+        )
+
+        return False
+
+
+def alert_signature(result):
+    """
+    Stable identity for the same setup.
+    A new zone or sweep level creates a new signature.
+    """
+
+    zone = result["zone"]
+    sweep = result["sweep"]
+    symbol = result["symbol"]
+
+    digits = (
+        3 if "JPY" in symbol
+        else 2 if "XAU" in symbol
+        else 5
+    )
+
+    return "|".join([
+        symbol,
+        zone["direction"],
+        zone["type"],
+        str(round(zone["low"], digits)),
+        str(round(zone["high"], digits)),
+        str(round(sweep["level"], digits)),
+    ])
+
+
+def prepare_entry_alerts(results, state, persistence_available):
+    alerts = []
+    stored = state.get("alerts", {})
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=ALERT_STATE_DAYS)
+
+    # Remove old signatures.
+    cleaned = {}
+
+    for signature, timestamp in stored.items():
+        try:
+            alert_time = parse_time(timestamp)
+
+            if alert_time and alert_time >= cutoff:
+                cleaned[signature] = timestamp
+
+        except Exception:
+            continue
+
+    stored = cleaned
+
+    for result in results:
+        if not result.get("entry_valid"):
+            continue
+
+        signature = alert_signature(result)
+
+        if persistence_available and signature in stored:
+            print(
+                f"Duplicate alert suppressed: "
+                f"{result['symbol']}"
+            )
+            continue
+
+        alert = (
+            "🚨 ODJ AI SMART TRADER V10 — "
+            "ENTRY CONDITIONS CONFIRMED\n\n"
+            + format_result(result)
+            + "\n\nALERT ONLY. Verify spread, execution "
+              "and risk before considering any trade."
+        )
+
+        alerts.append({
+            "signature": signature,
+            "message": alert,
+        })
+
+    return alerts, stored
 
 
 # ============================================================
@@ -984,50 +1335,96 @@ def main():
 
         except Exception as error:
             print(f"ERROR {symbol}: {error}")
+
             results.append({
                 "symbol": symbol,
                 "error": str(error),
             })
 
     report = [
-        "🤖 ODJ AI SMART TRADER V9",
+        "🤖 ODJ AI SMART TRADER V10",
         f"Scan: {scan_time}",
         "Mode: ALERT ONLY — NO AUTOMATIC TRADING",
         "Strict H1 + M15 entry validation",
+        "Fresh sweep limit: 4 completed M15 candles",
+        "Liquidity classification: Nearby / Distant",
         "",
     ]
 
     for result in results:
         if "error" in result:
             report.append(
-                f"{result['symbol']} — SCAN ERROR\n{result['error']}"
+                f"{result['symbol']} — SCAN ERROR\n"
+                f"{result['error']}"
             )
+
         else:
             report.append(format_result(result))
 
         report.append("------------------------")
 
     report.append(
-        "Entry alerts require alignment, BOS/CHOCH, fresh zone, "
-        "post-formation retest, rejection and confirmed sweep. "
+        "Entry alerts require H1/M15 alignment, "
+        "BOS/CHOCH, a fresh zone, retest, rejection "
+        "and a fresh confirmed liquidity sweep. "
         "These are conditional signals, not guaranteed outcomes."
     )
 
-    # Regular report every workflow run.
+    # Regular Telegram report.
     send_long_message("\n".join(report))
 
-    # Separate Telegram alert only when every entry condition passes.
-    for result in results:
-        if result.get("entry_valid"):
-            alert = (
-                "🚨 ODJ AI SMART TRADER — ENTRY CONDITIONS CONFIRMED\n\n"
-                + format_result(result)
-                + "\n\nALERT ONLY. Verify spread, execution and risk "
-                  "before considering any trade."
-            )
-            send_long_message(alert)
+    # Load persistent alert history.
+    state, sha, persistence_available = load_alert_state()
 
-    print("V9 scan completed.")
+    alerts, stored = prepare_entry_alerts(
+        results,
+        state,
+        persistence_available,
+    )
+
+    successfully_sent = []
+
+    # Send only eligible entry alerts.
+    for item in alerts:
+        try:
+            send_long_message(item["message"])
+
+            successfully_sent.append(item["signature"])
+
+            print(
+                f"Entry alert sent: {item['signature']}"
+            )
+
+        except Exception as error:
+            print(f"Entry alert failed: {error}")
+
+    # Save only alerts that Telegram accepted.
+    if persistence_available and successfully_sent:
+        now_text = datetime.now(timezone.utc).isoformat()
+
+        for signature in successfully_sent:
+            stored[signature] = now_text
+
+        # Keep the most recent stored alerts.
+        ordered = sorted(
+            stored.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        stored = dict(ordered[:MAX_STORED_ALERTS])
+
+        state["alerts"] = stored
+
+        save_alert_state(state, sha)
+
+    elif not persistence_available:
+        print(
+            "Persistent duplicate protection unavailable. "
+            "Entry alerts may repeat on later scans."
+        )
+
+    print("V10 scan completed.")
 
 
 if __name__ == "__main__":

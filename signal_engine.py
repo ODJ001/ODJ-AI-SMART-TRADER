@@ -9,11 +9,11 @@ from datetime import datetime, timedelta, timezone
 from statistics import median
 
 # ============================================================
-# ODJ AI SMART TRADER V10
-# STRICT ENTRY VALIDATION | ALERT ONLY
+# ODJ AI SMART TRADER V10.1
+# VERIFIED CANDLES | DIRECTION-ALIGNED ZONES | ALERT ONLY
 # ============================================================
 
-VERSION = "V10"
+VERSION = "V10.1"
 
 API_KEY = (
     os.getenv("TWELVE_DATA_API_KEY")
@@ -23,19 +23,25 @@ API_KEY = (
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Optional GitHub token for persistent duplicate-alert protection.
 GH_ALERT_TOKEN = os.getenv("GH_ALERT_TOKEN")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
 
 STATE_FILE = ".odj_alert_state.json"
-
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
 
 TIMEFRAMES = {
-    "H1": {"interval": "1h", "minutes": 60},
-    "M15": {"interval": "15min", "minutes": 15},
+    "H1": {
+        "interval": "1h",
+        "minutes": 60,
+        "max_stale_minutes": 180,
+    },
+    "M15": {
+        "interval": "15min",
+        "minutes": 15,
+        "max_stale_minutes": 45,
+    },
 }
 
 OUTPUTSIZE = 120
@@ -46,7 +52,6 @@ MAX_ZONE_DISTANCE_ATR = 2.5
 MIN_ZONE_QUALITY = 45
 MIN_ENTRY_SCORE = 80
 
-# V10 corrections
 MAX_SWEEP_AGE = 4
 NEARBY_LIQUIDITY_ATR = 3.0
 
@@ -55,7 +60,7 @@ MAX_STORED_ALERTS = 100
 
 
 # ============================================================
-# DATA FETCHING
+# TIME AND DATA VERIFICATION
 # ============================================================
 
 def parse_time(value):
@@ -95,7 +100,9 @@ def fetch_candles(symbol, timeframe):
     data = response.json()
 
     if "values" not in data:
-        raise RuntimeError(data.get("message", str(data)))
+        raise RuntimeError(
+            data.get("message", str(data))
+        )
 
     now = datetime.now(timezone.utc)
     duration = timedelta(minutes=settings["minutes"])
@@ -108,8 +115,10 @@ def fetch_candles(symbol, timeframe):
         if timestamp is None:
             continue
 
-        # Only completed candles are used.
-        if timestamp + duration > now:
+        # Exclude candles that have not yet closed.
+        expected_close = timestamp + duration
+
+        if expected_close > now:
             continue
 
         try:
@@ -128,10 +137,36 @@ def fetch_candles(symbol, timeframe):
 
     if len(candles) < 40:
         raise RuntimeError(
-            f"Insufficient completed candles: {symbol} {timeframe}"
+            f"Insufficient completed candles: "
+            f"{symbol} {timeframe}"
         )
 
-    return candles
+    latest = candles[-1]
+    latest_close_time = latest["time"] + duration
+
+    age_minutes = (
+        now - latest_close_time
+    ).total_seconds() / 60
+
+    maximum_age = settings["max_stale_minutes"]
+
+    if age_minutes > maximum_age:
+        raise RuntimeError(
+            f"STALE DATA: {symbol} {timeframe}. "
+            f"Latest completed candle ended "
+            f"{latest_close_time.strftime('%Y-%m-%d %H:%M UTC')}; "
+            f"data age {age_minutes:.1f} minutes, "
+            f"maximum allowed {maximum_age} minutes."
+        )
+
+    metadata = {
+        "latest_candle_start": latest["time"],
+        "latest_candle_close": latest_close_time,
+        "data_age_minutes": age_minutes,
+        "candles_count": len(candles),
+    }
+
+    return candles, metadata
 
 
 # ============================================================
@@ -243,8 +278,13 @@ def analyse_structure(candles):
             x["price"] for x in lows if x["index"] < i
         ]
 
-        bullish_level = max(prior_highs) if prior_highs else None
-        bearish_level = min(prior_lows) if prior_lows else None
+        bullish_level = (
+            max(prior_highs) if prior_highs else None
+        )
+
+        bearish_level = (
+            min(prior_lows) if prior_lows else None
+        )
 
         bullish_break = (
             bullish_level is not None
@@ -359,7 +399,6 @@ def detect_liquidity(candles, atr):
     buy = cluster_levels(highs, tolerance)
     sell = cluster_levels(lows, tolerance)
 
-    # Separate nearby levels from distant levels.
     def separate(levels):
         nearby = []
         distant = []
@@ -433,11 +472,9 @@ def detect_fvg(candles, atr):
         if gap_atr < 0.08:
             continue
 
-        # A previous retest invalidates the fresh zone.
-        # The latest candle is excluded here because it may
-        # be the first valid retest/rejection candle.
         previously_mitigated = any(
-            candle["low"] <= high and candle["high"] >= low
+            candle["low"] <= high
+            and candle["high"] >= low
             for candle in candles[i + 1:-1]
         )
 
@@ -511,7 +548,6 @@ def detect_order_block(candles, structure, atr):
         if distance > MAX_ZONE_DISTANCE_ATR:
             continue
 
-        # Allow the current candle to be the first retest.
         previously_mitigated = any(
             x["low"] <= high and x["high"] >= low
             for x in candles[i + 1:-1]
@@ -543,13 +579,26 @@ def detect_order_block(candles, structure, atr):
     return None
 
 
-def select_zone(candles, structure, atr):
+# ============================================================
+# DIRECTION-ALIGNED ZONE SELECTION
+# ============================================================
+
+def select_zone(candles, structure, atr, allowed_direction):
+    if allowed_direction not in ("BULLISH", "BEARISH"):
+        return None
+
     zones = detect_fvg(candles, atr)
 
     ob = detect_order_block(candles, structure, atr)
 
     if ob:
         zones.append(ob)
+
+    # Opposing-direction zones cannot qualify.
+    zones = [
+        zone for zone in zones
+        if zone["direction"] == allowed_direction
+    ]
 
     if not zones:
         return None
@@ -588,22 +637,21 @@ def validate_retest_rejection(candles, zone):
             "valid": False,
         }
 
-    later_candles = candles[zone_index + 1:]
+    last = candles[-1]
 
-    touched = [
-        c for c in later_candles
-        if c["low"] <= zone["high"]
-        and c["high"] >= zone["low"]
-    ]
+    current_touches = (
+        last["low"] <= zone["high"]
+        and last["high"] >= zone["low"]
+    )
 
-    if not touched:
+    # A previous touch does not count as a current retest.
+    if not current_touches:
         return {
             "retest": False,
             "rejection": False,
             "valid": False,
         }
 
-    last = candles[-1]
     candle_range = last["high"] - last["low"]
 
     if candle_range <= 0:
@@ -620,18 +668,6 @@ def validate_retest_rejection(candles, zone):
     close_position = (
         last["close"] - last["low"]
     ) / candle_range
-
-    current_touches = (
-        last["low"] <= zone["high"]
-        and last["high"] >= zone["low"]
-    )
-
-    if not current_touches:
-        return {
-            "retest": True,
-            "rejection": False,
-            "valid": False,
-        }
 
     if zone["direction"] == "BULLISH":
         lower_wick = (
@@ -667,7 +703,7 @@ def validate_retest_rejection(candles, zone):
 
 
 # ============================================================
-# V10 CONFIRMED LIQUIDITY SWEEP
+# CONFIRMED LIQUIDITY SWEEP
 # ============================================================
 
 def detect_confirmed_sweep(candles, structure):
@@ -676,21 +712,22 @@ def detect_confirmed_sweep(candles, structure):
 
     latest_index = len(candles) - 1
 
-    # Only inspect sweeps from the last four completed candles.
+    # The sweep must have a later completed follow-through candle.
     start = max(3, latest_index - MAX_SWEEP_AGE)
 
     for i in range(latest_index - 1, start - 1, -1):
         candle = candles[i]
         follow = candles[i + 1]
 
+        # Swing points need two right-side candles to be confirmed.
         prior_highs = [
             x["price"] for x in highs
-            if x["index"] < i
+            if x["index"] <= i - 2
         ]
 
         prior_lows = [
             x["price"] for x in lows
-            if x["index"] < i
+            if x["index"] <= i - 2
         ]
 
         if prior_highs:
@@ -789,21 +826,12 @@ def calculate_levels(candles, zone, atr):
 # EVALUATION
 # ============================================================
 
-def evaluate(symbol, h1, m15):
+def evaluate(symbol, h1, m15, h1_meta, m15_meta):
     h1_structure = analyse_structure(h1)
     m15_structure = analyse_structure(m15)
 
     atr = calculate_atr(m15)
     price = m15[-1]["close"]
-
-    zone = select_zone(m15, m15_structure, atr)
-
-    retest = validate_retest_rejection(m15, zone)
-
-    sweep = detect_confirmed_sweep(
-        m15,
-        m15_structure
-    )
 
     h1_direction = h1_structure["direction"]
     m15_direction = m15_structure["direction"]
@@ -811,6 +839,21 @@ def evaluate(symbol, h1, m15):
     aligned = (
         h1_direction in ("BULLISH", "BEARISH")
         and h1_direction == m15_direction
+    )
+
+    # Only select zones matching the H1 direction.
+    zone = select_zone(
+        m15,
+        m15_structure,
+        atr,
+        h1_direction,
+    )
+
+    retest = validate_retest_rejection(m15, zone)
+
+    sweep = detect_confirmed_sweep(
+        m15,
+        m15_structure
     )
 
     structure_direction = confirmed_structure_direction(
@@ -929,6 +972,8 @@ def evaluate(symbol, h1, m15):
         "buy_far": buy_far,
         "sell_near": sell_near,
         "sell_far": sell_far,
+        "h1_meta": h1_meta,
+        "m15_meta": m15_meta,
     }
 
 
@@ -979,11 +1024,21 @@ def format_result(r):
             f"Watchlist {r['watch_score']}/100 | "
             f"Entry {r['entry_score']}/100"
         ),
+        (
+            "H1 candle ended: "
+            f"{r['h1_meta']['latest_candle_close'].strftime('%Y-%m-%d %H:%M UTC')} "
+            f"| Data age: {r['h1_meta']['data_age_minutes']:.1f} min"
+        ),
+        (
+            "M15 candle ended: "
+            f"{r['m15_meta']['latest_candle_close'].strftime('%Y-%m-%d %H:%M UTC')} "
+            f"| Data age: {r['m15_meta']['data_age_minutes']:.1f} min"
+        ),
     ]
 
     if zone:
         lines.append(
-            f"Zone {zone['type']} {zone['direction']} "
+            f"Aligned zone {zone['type']} {zone['direction']} "
             f"{fmt(zone['low'], symbol)}–"
             f"{fmt(zone['high'], symbol)} | "
             f"Quality {zone['quality']}/100 | "
@@ -997,7 +1052,9 @@ def format_result(r):
         )
 
     else:
-        lines.append("Zone: No fresh qualifying zone")
+        lines.append(
+            "Zone: No fresh qualifying zone aligned with H1 direction"
+        )
 
     if sweep:
         lines.append(
@@ -1103,7 +1160,7 @@ def send_long_message(message):
 
 
 # ============================================================
-# V10 PERSISTENT DUPLICATE-ALERT PROTECTION
+# PERSISTENT DUPLICATE-ALERT PROTECTION
 # ============================================================
 
 def github_headers():
@@ -1125,13 +1182,6 @@ def github_state_url():
 
 
 def load_alert_state():
-    """
-    Returns:
-        state, sha, persistence_available
-
-    A missing state file is normal on the first run.
-    """
-
     if not GH_ALERT_TOKEN or not GITHUB_REPOSITORY:
         print(
             "WARNING: GH_ALERT_TOKEN not configured. "
@@ -1222,11 +1272,6 @@ def save_alert_state(state, sha):
 
 
 def alert_signature(result):
-    """
-    Stable identity for the same setup.
-    A new zone or sweep level creates a new signature.
-    """
-
     zone = result["zone"]
     sweep = result["sweep"]
     symbol = result["symbol"]
@@ -1254,18 +1299,13 @@ def prepare_entry_alerts(results, state, persistence_available):
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=ALERT_STATE_DAYS)
 
-    # Remove old signatures.
     cleaned = {}
 
     for signature, timestamp in stored.items():
-        try:
-            alert_time = parse_time(timestamp)
+        alert_time = parse_time(timestamp)
 
-            if alert_time and alert_time >= cutoff:
-                cleaned[signature] = timestamp
-
-        except Exception:
-            continue
+        if alert_time and alert_time >= cutoff:
+            cleaned[signature] = timestamp
 
     stored = cleaned
 
@@ -1283,8 +1323,8 @@ def prepare_entry_alerts(results, state, persistence_available):
             continue
 
         alert = (
-            "🚨 ODJ AI SMART TRADER V10 — "
-            "ENTRY CONDITIONS CONFIRMED\n\n"
+            f"🚨 ODJ AI SMART TRADER {VERSION} "
+            "— ENTRY CONDITIONS CONFIRMED\n\n"
             + format_result(result)
             + "\n\nALERT ONLY. Verify spread, execution "
               "and risk before considering any trade."
@@ -1319,13 +1359,20 @@ def main():
         try:
             print(f"Scanning {symbol}")
 
-            h1 = fetch_candles(symbol, "H1")
+            h1, h1_meta = fetch_candles(symbol, "H1")
             time.sleep(REQUEST_DELAY)
 
-            m15 = fetch_candles(symbol, "M15")
+            m15, m15_meta = fetch_candles(symbol, "M15")
             time.sleep(REQUEST_DELAY)
 
-            result = evaluate(symbol, h1, m15)
+            result = evaluate(
+                symbol,
+                h1,
+                m15,
+                h1_meta,
+                m15_meta,
+            )
+
             results.append(result)
 
             print(
@@ -1342,10 +1389,13 @@ def main():
             })
 
     report = [
-        "🤖 ODJ AI SMART TRADER V10",
+        f"🤖 ODJ AI SMART TRADER {VERSION}",
         f"Scan: {scan_time}",
         "Mode: ALERT ONLY — NO AUTOMATIC TRADING",
-        "Strict H1 + M15 entry validation",
+        "Verified completed H1 and M15 candles",
+        "H1 maximum data age: 180 minutes",
+        "M15 maximum data age: 45 minutes",
+        "Strict direction-aligned zone validation",
         "Fresh sweep limit: 4 completed M15 candles",
         "Liquidity classification: Nearby / Distant",
         "",
@@ -1365,15 +1415,16 @@ def main():
 
     report.append(
         "Entry alerts require H1/M15 alignment, "
-        "BOS/CHOCH, a fresh zone, retest, rejection "
-        "and a fresh confirmed liquidity sweep. "
+        "BOS/CHOCH, a fresh direction-aligned zone, "
+        "current-candle retest, rejection and a fresh "
+        "confirmed liquidity sweep. "
         "These are conditional signals, not guaranteed outcomes."
     )
 
-    # Regular Telegram report.
+    # Send regular market report.
     send_long_message("\n".join(report))
 
-    # Load persistent alert history.
+    # Persistent duplicate-alert protection.
     state, sha, persistence_available = load_alert_state()
 
     alerts, stored = prepare_entry_alerts(
@@ -1384,7 +1435,6 @@ def main():
 
     successfully_sent = []
 
-    # Send only eligible entry alerts.
     for item in alerts:
         try:
             send_long_message(item["message"])
@@ -1398,14 +1448,12 @@ def main():
         except Exception as error:
             print(f"Entry alert failed: {error}")
 
-    # Save only alerts that Telegram accepted.
     if persistence_available and successfully_sent:
         now_text = datetime.now(timezone.utc).isoformat()
 
         for signature in successfully_sent:
             stored[signature] = now_text
 
-        # Keep the most recent stored alerts.
         ordered = sorted(
             stored.items(),
             key=lambda item: item[1],
@@ -1424,7 +1472,7 @@ def main():
             "Entry alerts may repeat on later scans."
         )
 
-    print("V10 scan completed.")
+    print(f"{VERSION} scan completed.")
 
 
 if __name__ == "__main__":

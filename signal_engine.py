@@ -9,11 +9,11 @@ from datetime import datetime, timedelta, timezone
 from statistics import median
 
 # ============================================================
-# ODJ AI SMART TRADER V10.1
-# VERIFIED CANDLES | DIRECTION-ALIGNED ZONES | ALERT ONLY
+# ODJ AI SMART TRADER V11
+# COMPLETE TRADE SETUP | VERIFIED CANDLES | ALERT ONLY
 # ============================================================
 
-VERSION = "V10.1"
+VERSION = "V11"
 
 API_KEY = (
     os.getenv("TWELVE_DATA_API_KEY")
@@ -54,6 +54,16 @@ MIN_ENTRY_SCORE = 80
 
 MAX_SWEEP_AGE = 4
 NEARBY_LIQUIDITY_ATR = 3.0
+
+# Trade risk controls
+STOP_BUFFER_ATR = 0.25
+MIN_STOP_ATR = 0.15
+MAX_STOP_ATR = 2.5
+
+# Profit targets expressed as multiples of initial risk
+TP1_R = 1.0
+TP2_R = 2.0
+TP3_R = 3.0
 
 ALERT_STATE_DAYS = 30
 MAX_STORED_ALERTS = 100
@@ -100,9 +110,7 @@ def fetch_candles(symbol, timeframe):
     data = response.json()
 
     if "values" not in data:
-        raise RuntimeError(
-            data.get("message", str(data))
-        )
+        raise RuntimeError(data.get("message", str(data)))
 
     now = datetime.now(timezone.utc)
     duration = timedelta(minutes=settings["minutes"])
@@ -115,9 +123,9 @@ def fetch_candles(symbol, timeframe):
         if timestamp is None:
             continue
 
-        # Exclude candles that have not yet closed.
         expected_close = timestamp + duration
 
+        # Ignore incomplete candles.
         if expected_close > now:
             continue
 
@@ -137,8 +145,7 @@ def fetch_candles(symbol, timeframe):
 
     if len(candles) < 40:
         raise RuntimeError(
-            f"Insufficient completed candles: "
-            f"{symbol} {timeframe}"
+            f"Insufficient completed candles: {symbol} {timeframe}"
         )
 
     latest = candles[-1]
@@ -153,10 +160,9 @@ def fetch_candles(symbol, timeframe):
     if age_minutes > maximum_age:
         raise RuntimeError(
             f"STALE DATA: {symbol} {timeframe}. "
-            f"Latest completed candle ended "
+            f"Latest candle ended "
             f"{latest_close_time.strftime('%Y-%m-%d %H:%M UTC')}; "
-            f"data age {age_minutes:.1f} minutes, "
-            f"maximum allowed {maximum_age} minutes."
+            f"age {age_minutes:.1f} minutes."
         )
 
     metadata = {
@@ -243,7 +249,7 @@ def determine_trend(highs, lows):
 
 
 # ============================================================
-# MARKET STRUCTURE: BOS / CHOCH
+# MARKET STRUCTURE
 # ============================================================
 
 def analyse_structure(candles):
@@ -278,13 +284,8 @@ def analyse_structure(candles):
             x["price"] for x in lows if x["index"] < i
         ]
 
-        bullish_level = (
-            max(prior_highs) if prior_highs else None
-        )
-
-        bearish_level = (
-            min(prior_lows) if prior_lows else None
-        )
+        bullish_level = max(prior_highs) if prior_highs else None
+        bearish_level = min(prior_lows) if prior_lows else None
 
         bullish_break = (
             bullish_level is not None
@@ -350,7 +351,7 @@ def confirmed_structure_direction(structure):
 
 
 # ============================================================
-# LIQUIDITY CLUSTERS
+# LIQUIDITY
 # ============================================================
 
 def cluster_levels(levels, tolerance):
@@ -429,7 +430,7 @@ def detect_liquidity(candles, atr):
 
 
 # ============================================================
-# FVG DETECTION
+# FAIR VALUE GAPS
 # ============================================================
 
 def detect_fvg(candles, atr):
@@ -509,7 +510,7 @@ def detect_fvg(candles, atr):
 
 
 # ============================================================
-# ORDER BLOCK DETECTION
+# ORDER BLOCK
 # ============================================================
 
 def detect_order_block(candles, structure, atr):
@@ -580,7 +581,7 @@ def detect_order_block(candles, structure, atr):
 
 
 # ============================================================
-# DIRECTION-ALIGNED ZONE SELECTION
+# DIRECTION-ALIGNED ZONE
 # ============================================================
 
 def select_zone(candles, structure, atr, allowed_direction):
@@ -594,7 +595,6 @@ def select_zone(candles, structure, atr, allowed_direction):
     if ob:
         zones.append(ob)
 
-    # Opposing-direction zones cannot qualify.
     zones = [
         zone for zone in zones
         if zone["direction"] == allowed_direction
@@ -616,7 +616,7 @@ def select_zone(candles, structure, atr, allowed_direction):
 
 
 # ============================================================
-# RETEST AND REJECTION VALIDATION
+# RETEST AND REJECTION
 # ============================================================
 
 def validate_retest_rejection(candles, zone):
@@ -644,7 +644,6 @@ def validate_retest_rejection(candles, zone):
         and last["high"] >= zone["low"]
     )
 
-    # A previous touch does not count as a current retest.
     if not current_touches:
         return {
             "retest": False,
@@ -711,15 +710,12 @@ def detect_confirmed_sweep(candles, structure):
     lows = structure["lows"]
 
     latest_index = len(candles) - 1
-
-    # The sweep must have a later completed follow-through candle.
     start = max(3, latest_index - MAX_SWEEP_AGE)
 
     for i in range(latest_index - 1, start - 1, -1):
         candle = candles[i]
         follow = candles[i + 1]
 
-        # Swing points need two right-side candles to be confirmed.
         prior_highs = [
             x["price"] for x in highs
             if x["index"] <= i - 2
@@ -780,45 +776,77 @@ def detect_confirmed_sweep(candles, structure):
 
 
 # ============================================================
-# ENTRY LEVELS
+# V11 COMPLETE TRADE LEVELS
 # ============================================================
 
 def calculate_levels(candles, zone, atr):
     if not zone or atr <= 0:
         return None
 
-    entry = candles[-1]["close"]
+    last = candles[-1]
+
+    # Entry is the close of the completed rejection candle.
+    entry = last["close"]
 
     if zone["direction"] == "BULLISH":
         stop = min(
             zone["low"],
-            candles[-1]["low"]
-        ) - atr * 0.25
+            last["low"]
+        ) - atr * STOP_BUFFER_ATR
 
         risk = entry - stop
 
         if risk <= 0:
             return None
 
-        target = entry + risk * 2
+        direction = "BUY"
 
-    else:
+        tp1 = entry + risk * TP1_R
+        tp2 = entry + risk * TP2_R
+        tp3 = entry + risk * TP3_R
+
+    elif zone["direction"] == "BEARISH":
         stop = max(
             zone["high"],
-            candles[-1]["high"]
-        ) + atr * 0.25
+            last["high"]
+        ) + atr * STOP_BUFFER_ATR
 
         risk = stop - entry
 
         if risk <= 0:
             return None
 
-        target = entry - risk * 2
+        direction = "SELL"
+
+        tp1 = entry - risk * TP1_R
+        tp2 = entry - risk * TP2_R
+        tp3 = entry - risk * TP3_R
+
+    else:
+        return None
+
+    risk_atr = risk / atr
+
+    # Reject stops that are too tight or excessively wide.
+    if risk_atr < MIN_STOP_ATR:
+        return None
+
+    if risk_atr > MAX_STOP_ATR:
+        return None
 
     return {
+        "direction": direction,
         "entry": entry,
         "stop": stop,
-        "target": target,
+        "risk": risk,
+        "risk_atr": risk_atr,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "rr1": TP1_R,
+        "rr2": TP2_R,
+        "rr3": TP3_R,
+        "entry_candle_time": last["time"],
     }
 
 
@@ -841,7 +869,6 @@ def evaluate(symbol, h1, m15, h1_meta, m15_meta):
         and h1_direction == m15_direction
     )
 
-    # Only select zones matching the H1 direction.
     zone = select_zone(
         m15,
         m15_structure,
@@ -896,7 +923,7 @@ def evaluate(symbol, h1, m15, h1_meta, m15_meta):
     if sweep_confirmed:
         entry_score += 20
 
-    entry_valid = all([
+    entry_conditions = all([
         aligned,
         structure_confirmed,
         zone_confirmed,
@@ -907,12 +934,18 @@ def evaluate(symbol, h1, m15, h1_meta, m15_meta):
     ])
 
     levels = None
+    entry_valid = False
+    level_rejection_reason = None
 
-    if entry_valid:
+    if entry_conditions:
         levels = calculate_levels(m15, zone, atr)
 
-        if levels is None:
-            entry_valid = False
+        if levels is not None:
+            entry_valid = True
+        else:
+            level_rejection_reason = (
+                "Trade rejected: invalid or excessive stop distance."
+            )
 
     watch_score = 0
 
@@ -968,6 +1001,7 @@ def evaluate(symbol, h1, m15, h1_meta, m15_meta):
         "entry_score": entry_score,
         "entry_valid": entry_valid,
         "levels": levels,
+        "level_rejection_reason": level_rejection_reason,
         "buy_near": buy_near,
         "buy_far": buy_far,
         "sell_near": sell_near,
@@ -978,7 +1012,7 @@ def evaluate(symbol, h1, m15, h1_meta, m15_meta):
 
 
 # ============================================================
-# FORMATTING
+# PRICE FORMATTING
 # ============================================================
 
 def fmt(value, symbol):
@@ -1004,6 +1038,57 @@ def liquidity_text(levels, symbol):
         for x in levels
     )
 
+
+# ============================================================
+# V11 TRADE PLAN FORMAT
+# ============================================================
+
+def format_trade_plan(result):
+    symbol = result["symbol"]
+    lv = result["levels"]
+
+    direction_emoji = (
+        "🟢" if lv["direction"] == "BUY" else "🔴"
+    )
+
+    return "\n".join([
+        "━━━━━━━━━━━━━━━━━━",
+        f"{direction_emoji} {lv['direction']} {symbol}",
+        "🚨 ENTRY CONDITIONS CONFIRMED",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Entry reference: {fmt(lv['entry'], symbol)}",
+        f"Stop Loss: {fmt(lv['stop'], symbol)}",
+        "",
+        f"Take Profit 1: {fmt(lv['tp1'], symbol)}  (1:1)",
+        f"Take Profit 2: {fmt(lv['tp2'], symbol)}  (1:2)",
+        f"Take Profit 3: {fmt(lv['tp3'], symbol)}  (1:3)",
+        "",
+        f"Stop distance: {fmt(lv['risk'], symbol)}",
+        f"Stop distance: {lv['risk_atr']:.2f} ATR",
+        "",
+        f"H1 direction: {result['h1']['direction']}",
+        f"M15 direction: {result['m15']['direction']}",
+        f"BOS: {result['m15']['bos']}",
+        f"CHOCH: {result['m15']['choch']}",
+        f"Zone: {result['zone']['type']} "
+        f"{result['zone']['direction']}",
+        f"Zone quality: {result['zone']['quality']}/100",
+        f"Retest: {'YES' if result['retest']['retest'] else 'NO'}",
+        f"Rejection: {'YES' if result['retest']['rejection'] else 'NO'}",
+        f"Sweep: {result['sweep']['type']}",
+        f"Sweep age: {result['sweep']['age']} M15 candles",
+        "",
+        "Entry reference is based on the completed M15 candle close.",
+        "Check the live price before execution. Do not chase a missed entry.",
+        "Alert only — no automatic trading.",
+        "━━━━━━━━━━━━━━━━━━",
+    ])
+
+
+# ============================================================
+# SCAN REPORT FORMAT
+# ============================================================
 
 def format_result(r):
     symbol = r["symbol"]
@@ -1090,18 +1175,24 @@ def format_result(r):
         lv = r["levels"]
 
         lines.extend([
-            "ENTRY CONDITIONS CONFIRMED — ALERT ONLY",
-            f"Direction: {r['h1']['direction']}",
-            f"Entry reference: {fmt(lv['entry'], symbol)}",
-            f"Stop loss: {fmt(lv['stop'], symbol)}",
-            f"Take profit: {fmt(lv['target'], symbol)}",
-            "Risk/reward reference: 1:2",
+            "",
+            "ENTRY CONDITIONS CONFIRMED",
+            f"Direction: {lv['direction']}",
+            f"Entry: {fmt(lv['entry'], symbol)}",
+            f"SL: {fmt(lv['stop'], symbol)}",
+            f"TP1: {fmt(lv['tp1'], symbol)}",
+            f"TP2: {fmt(lv['tp2'], symbol)}",
+            f"TP3: {fmt(lv['tp3'], symbol)}",
+            "Risk/reward: 1:1 | 1:2 | 1:3",
         ])
 
     else:
         lines.append(
             "No entry alert. Wait for every condition to confirm."
         )
+
+        if r.get("level_rejection_reason"):
+            lines.append(r["level_rejection_reason"])
 
     return "\n".join(lines)
 
@@ -1160,7 +1251,7 @@ def send_long_message(message):
 
 
 # ============================================================
-# PERSISTENT DUPLICATE-ALERT PROTECTION
+# PERSISTENT DUPLICATE ALERT PROTECTION
 # ============================================================
 
 def github_headers():
@@ -1188,7 +1279,7 @@ def load_alert_state():
             "Persistent duplicate protection is disabled."
         )
 
-        return {}, None, False
+        return {"alerts": {}}, None, False
 
     try:
         response = requests.get(
@@ -1224,7 +1315,7 @@ def load_alert_state():
             f"{error}"
         )
 
-        return {}, None, False
+        return {"alerts": {}}, None, False
 
 
 def save_alert_state(state, sha):
@@ -1243,7 +1334,7 @@ def save_alert_state(state, sha):
         ).decode("utf-8")
 
         payload = {
-            "message": "Update ODJ Smart Trader alert state",
+            "message": "Update ODJ Smart Trader V11 alert state",
             "content": encoded,
         }
 
@@ -1317,17 +1408,13 @@ def prepare_entry_alerts(results, state, persistence_available):
 
         if persistence_available and signature in stored:
             print(
-                f"Duplicate alert suppressed: "
-                f"{result['symbol']}"
+                f"Duplicate alert suppressed: {result['symbol']}"
             )
             continue
 
         alert = (
-            f"🚨 ODJ AI SMART TRADER {VERSION} "
-            "— ENTRY CONDITIONS CONFIRMED\n\n"
-            + format_result(result)
-            + "\n\nALERT ONLY. Verify spread, execution "
-              "and risk before considering any trade."
+            f"🤖 ODJ AI SMART TRADER {VERSION}\n"
+            + format_trade_plan(result)
         )
 
         alerts.append({
@@ -1397,7 +1484,10 @@ def main():
         "M15 maximum data age: 45 minutes",
         "Strict direction-aligned zone validation",
         "Fresh sweep limit: 4 completed M15 candles",
-        "Liquidity classification: Nearby / Distant",
+        "Nearby / distant liquidity classification",
+        "V11 complete trade levels enabled",
+        "TP1 = 1:1 | TP2 = 1:2 | TP3 = 1:3",
+        f"Maximum stop distance: {MAX_STOP_ATR} ATR",
         "",
     ]
 
@@ -1418,13 +1508,13 @@ def main():
         "BOS/CHOCH, a fresh direction-aligned zone, "
         "current-candle retest, rejection and a fresh "
         "confirmed liquidity sweep. "
-        "These are conditional signals, not guaranteed outcomes."
+        "Trade levels are calculated references, not guaranteed fills."
     )
 
     # Send regular market report.
     send_long_message("\n".join(report))
 
-    # Persistent duplicate-alert protection.
+    # Duplicate-alert protection.
     state, sha, persistence_available = load_alert_state()
 
     alerts, stored = prepare_entry_alerts(

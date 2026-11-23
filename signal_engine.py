@@ -1,1239 +1,386 @@
-import os
-import time
-import json
-import base64
-import math
-import requests
-
+import os, time, json, base64, math, requests
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
-# ============================================================
-# ODJ AI SMART TRADER V12
-# MARKET STRUCTURE | TRADE PLAN | 1% RISK POSITION SIZING
-# ALERT ONLY - NEVER EXECUTES TRADES
-# ============================================================
-
-VERSION = "V12"
-
+VERSION = "V13"
 API_KEY = os.getenv("TWELVE_DATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GH_ALERT_TOKEN = os.getenv("GH_ALERT_TOKEN")
-GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
-
+BOT_TOKEN, CHAT_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+GH_TOKEN, REPO = os.getenv("GH_ALERT_TOKEN"), os.getenv("GITHUB_REPOSITORY")
 STATE_FILE = ".odj_alert_state.json"
 BASE_URL = "https://api.twelvedata.com/time_series"
-
 SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
-
-TIMEFRAMES = {
-    "H1": {"interval": "1h", "minutes": 60, "max_stale_minutes": 180},
-    "M15": {"interval": "15min", "minutes": 15, "max_stale_minutes": 45},
-}
-
-OUTPUTSIZE = 120
-REQUEST_DELAY = 8
-
-MAX_ZONE_AGE = 32
-MAX_ZONE_DISTANCE_ATR = 2.5
-MIN_ZONE_QUALITY = 45
-MIN_ENTRY_SCORE = 80
-MAX_SWEEP_AGE = 4
-NEARBY_LIQUIDITY_ATR = 3.0
-
-STOP_BUFFER_ATR = 0.25
-MIN_STOP_ATR = 0.15
-MAX_STOP_ATR = 2.5
-
-TP1_R = 1.0
-TP2_R = 2.0
-TP3_R = 3.0
-
-ALERT_STATE_DAYS = 30
-MAX_STORED_ALERTS = 100
-
-# ============================================================
-# ACCOUNT AND BROKER CONFIGURATION
-# ============================================================
-
-def env_float(name, default):
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return float(default)
-    try:
-        return float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be a number.") from exc
-
-ACCOUNT_BALANCE = env_float("ACCOUNT_BALANCE", 5000)
+FRAMES = {"H1": ("1h", 60, 180), "M15": ("15min", 15, 45)}
+OUTPUTSIZE, REQUEST_DELAY = 120, 8
+MAX_ZONE_AGE, MAX_ZONE_DISTANCE_ATR, MIN_ZONE_QUALITY = 32, 3.0, 35
+MAX_SWEEP_AGE, LIQUIDITY_ATR = 4, 3.0
+STOP_BUFFER_ATR, MIN_STOP_ATR, MAX_STOP_ATR = .25, .15, 2.5
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "5000"))
 ACCOUNT_CURRENCY = os.getenv("ACCOUNT_CURRENCY", "USD").strip().upper()
-RISK_PERCENT = env_float("RISK_PERCENT", 1.0)
-
-# Contract size, minimum lot and lot step are deliberately NOT
-# defaulted. Enter the exact values shown for your Exness account.
-# Maximum lot is optional. Missing required specs means no lot advice.
-BROKER_SPECS = {
-    "EUR/USD": {
-        "contract_size": os.getenv("CONTRACT_SIZE_EURUSD"),
-        "min_lot": os.getenv("MIN_LOT_EURUSD"),
-        "lot_step": os.getenv("LOT_STEP_EURUSD"),
-        "max_lot": os.getenv("MAX_LOT_EURUSD"),
-    },
-    "GBP/USD": {
-        "contract_size": os.getenv("CONTRACT_SIZE_GBPUSD"),
-        "min_lot": os.getenv("MIN_LOT_GBPUSD"),
-        "lot_step": os.getenv("LOT_STEP_GBPUSD"),
-        "max_lot": os.getenv("MAX_LOT_GBPUSD"),
-    },
-    "USD/JPY": {
-        "contract_size": os.getenv("CONTRACT_SIZE_USDJPY"),
-        "min_lot": os.getenv("MIN_LOT_USDJPY"),
-        "lot_step": os.getenv("LOT_STEP_USDJPY"),
-        "max_lot": os.getenv("MAX_LOT_USDJPY"),
-    },
-    "XAU/USD": {
-        "contract_size": os.getenv("CONTRACT_SIZE_XAUUSD"),
-        "min_lot": os.getenv("MIN_LOT_XAUUSD"),
-        "lot_step": os.getenv("LOT_STEP_XAUUSD"),
-        "max_lot": os.getenv("MAX_LOT_XAUUSD"),
-    },
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
+TP_R = (1.0, 2.0, 3.0)
+BROKER = {
+ "EUR/USD": (os.getenv("CONTRACT_SIZE_EURUSD"), os.getenv("MIN_LOT_EURUSD"), os.getenv("LOT_STEP_EURUSD"), os.getenv("MAX_LOT_EURUSD")),
+ "GBP/USD": (os.getenv("CONTRACT_SIZE_GBPUSD"), os.getenv("MIN_LOT_GBPUSD"), os.getenv("LOT_STEP_GBPUSD"), os.getenv("MAX_LOT_GBPUSD")),
+ "USD/JPY": (os.getenv("CONTRACT_SIZE_USDJPY"), os.getenv("MIN_LOT_USDJPY"), os.getenv("LOT_STEP_USDJPY"), os.getenv("MAX_LOT_USDJPY")),
+ "XAU/USD": (os.getenv("CONTRACT_SIZE_XAUUSD"), os.getenv("MIN_LOT_XAUUSD"), os.getenv("LOT_STEP_XAUUSD"), os.getenv("MAX_LOT_XAUUSD")),
 }
-
-# ============================================================
-# TIME AND DATA VERIFICATION
-# ============================================================
 
 def parse_time(value):
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        d = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
     except Exception:
         return None
 
-def fetch_candles(symbol, timeframe):
-    if not API_KEY:
-        raise RuntimeError("Missing Twelve Data API key")
-
-    settings = TIMEFRAMES[timeframe]
-    response = requests.get(
-        BASE_URL,
-        params={
-            "symbol": symbol,
-            "interval": settings["interval"],
-            "outputsize": OUTPUTSIZE,
-            "timezone": "UTC",
-            "apikey": API_KEY,
-        },
-        timeout=25,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    if "values" not in data:
-        raise RuntimeError(data.get("message", str(data)))
-
-    now = datetime.now(timezone.utc)
-    duration = timedelta(minutes=settings["minutes"])
-    candles = []
-
+def fetch_candles(symbol, frame):
+    if not API_KEY: raise RuntimeError("Missing Twelve Data API key")
+    interval, minutes, stale_limit = FRAMES[frame]
+    r = requests.get(BASE_URL, params={"symbol":symbol,"interval":interval,"outputsize":OUTPUTSIZE,"timezone":"UTC","apikey":API_KEY}, timeout=25)
+    r.raise_for_status(); data = r.json()
+    if "values" not in data: raise RuntimeError(data.get("message", str(data)))
+    now, duration, candles = datetime.now(timezone.utc), timedelta(minutes=minutes), []
     for item in data["values"]:
-        timestamp = parse_time(item.get("datetime"))
-        if timestamp is None:
-            continue
-
-        expected_close = timestamp + duration
-        if expected_close > now:
-            continue
-
+        stamp = parse_time(item.get("datetime"))
+        if stamp is None or stamp + duration > now: continue
         try:
-            candles.append({
-                "time": timestamp,
-                "open": float(item["open"]),
-                "high": float(item["high"]),
-                "low": float(item["low"]),
-                "close": float(item["close"]),
-            })
-        except (ValueError, TypeError, KeyError):
-            continue
+            c = {"time":stamp,"open":float(item["open"]),"high":float(item["high"]),"low":float(item["low"]),"close":float(item["close"])}
+            if c["high"] >= max(c["open"],c["close"]) and c["low"] <= min(c["open"],c["close"]): candles.append(c)
+        except (ValueError, TypeError, KeyError): pass
+    candles.sort(key=lambda x:x["time"])
+    if len(candles)<40: raise RuntimeError(f"Insufficient completed candles: {symbol} {frame}")
+    ended=candles[-1]["time"]+duration; age=(now-ended).total_seconds()/60
+    if age>stale_limit: raise RuntimeError(f"STALE DATA: {symbol} {frame}, age {age:.1f} minutes")
+    return candles, {"latest_candle_close":ended,"data_age_minutes":age,"candles_count":len(candles)}
 
-    candles.sort(key=lambda x: x["time"])
+def atr(candles, period=14):
+    tr=[]
+    for i in range(1,len(candles)):
+        c,p=candles[i],candles[i-1]
+        tr.append(max(c["high"]-c["low"],abs(c["high"]-p["close"]),abs(c["low"]-p["close"])))
+    return sum(tr[-period:])/period if len(tr)>=period else 0.0
 
-    if len(candles) < 40:
-        raise RuntimeError(f"Insufficient completed candles: {symbol} {timeframe}")
+def swings(candles,left=2,right=2):
+    hi,lo=[],[]
+    for i in range(left,len(candles)-right):
+        h,l=candles[i]["high"],candles[i]["low"]
+        if all(h>candles[j]["high"] for j in range(i-left,i+right+1) if j!=i): hi.append({"index":i,"price":h})
+        if all(l<candles[j]["low"] for j in range(i-left,i+right+1) if j!=i): lo.append({"index":i,"price":l})
+    return hi,lo
 
-    latest_close_time = candles[-1]["time"] + duration
-    age_minutes = (now - latest_close_time).total_seconds() / 60
-
-    if age_minutes > settings["max_stale_minutes"]:
-        raise RuntimeError(
-            f"STALE DATA: {symbol} {timeframe}. Latest candle ended "
-            f"{latest_close_time.strftime('%Y-%m-%d %H:%M UTC')}; "
-            f"age {age_minutes:.1f} minutes."
-        )
-
-    metadata = {
-        "latest_candle_start": candles[-1]["time"],
-        "latest_candle_close": latest_close_time,
-        "data_age_minutes": age_minutes,
-        "candles_count": len(candles),
-    }
-    return candles, metadata
-
-# ============================================================
-# ATR AND SWINGS
-# ============================================================
-
-def calculate_atr(candles, period=14):
-    ranges = []
-    for i in range(1, len(candles)):
-        current, previous = candles[i], candles[i - 1]
-        ranges.append(max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"]),
-        ))
-    if len(ranges) < period:
-        return 0
-    return sum(ranges[-period:]) / period
-
-def find_swings(candles, left=2, right=2):
-    highs, lows = [], []
-    for i in range(left, len(candles) - right):
-        high, low = candles[i]["high"], candles[i]["low"]
-        if all(
-            high > candles[j]["high"]
-            for j in range(i-left, i+right+1) if j != i
-        ):
-            highs.append({"index": i, "price": high})
-        if all(
-            low < candles[j]["low"]
-            for j in range(i-left, i+right+1) if j != i
-        ):
-            lows.append({"index": i, "price": low})
-    return highs, lows
-
-def determine_trend(highs, lows):
-    if len(highs) < 2 or len(lows) < 2:
-        return "RANGING"
-    hh = highs[-1]["price"] > highs[-2]["price"]
-    hl = lows[-1]["price"] > lows[-2]["price"]
-    lh = highs[-1]["price"] < highs[-2]["price"]
-    ll = lows[-1]["price"] < lows[-2]["price"]
-    if hh and hl:
-        return "BULLISH"
-    if lh and ll:
-        return "BEARISH"
+def trend(hi,lo):
+    if len(hi)<2 or len(lo)<2:return "RANGING"
+    if hi[-1]["price"]>hi[-2]["price"] and lo[-1]["price"]>lo[-2]["price"]:return "BULLISH"
+    if hi[-1]["price"]<hi[-2]["price"] and lo[-1]["price"]<lo[-2]["price"]:return "BEARISH"
     return "RANGING"
 
-# ============================================================
-# MARKET STRUCTURE
-# ============================================================
+def structure(candles):
+    hi,lo=swings(candles); direction=trend(hi,lo)
+    out={"direction":direction,"bos":"NONE","choch":"NONE","range_break":"NONE","event_index":None,"event_level":None,"event_age":None,"highs":hi,"lows":lo}
+    # Recent close breaks are tested against the latest confirmed pivot, not
+    # the most extreme pivot in the entire history.
+    for i in range(max(2,len(candles)-34),len(candles)):
+        ph=[x for x in hi if x["index"]<i]; pl=[x for x in lo if x["index"]<i]
+        if not ph or not pl:continue
+        upper,lower=ph[-1]["price"],pl[-1]["price"]; prev,close=candles[i-1]["close"],candles[i]["close"]
+        if prev<=upper and close>upper:
+            out.update(event_index=i,event_level=upper,event_age=len(candles)-1-i)
+            if direction=="BEARISH":out.update(choch="BULLISH")
+            elif direction=="RANGING":out.update(range_break="BULLISH")
+            else:out.update(bos="BULLISH")
+        elif prev>=lower and close<lower:
+            out.update(event_index=i,event_level=lower,event_age=len(candles)-1-i)
+            if direction=="BULLISH":out.update(choch="BEARISH")
+            elif direction=="RANGING":out.update(range_break="BEARISH")
+            else:out.update(bos="BEARISH")
+    return out
 
-def analyse_structure(candles):
-    highs, lows = find_swings(candles)
-    trend = determine_trend(highs, lows)
-    result = {
-        "direction": trend,
-        "bos": "NONE",
-        "choch": "NONE",
-        "range_break": "NONE",
-        "event_index": None,
-        "event_level": None,
-        "highs": highs,
-        "lows": lows,
-    }
+def structure_event(s):
+    return s["bos"] if s["bos"]!="NONE" else s["choch"] if s["choch"]!="NONE" else None
 
-    if not highs or not lows:
-        return result
+def fvg_zones(candles,a):
+    out=[]
+    if a<=0:return out
+    price=candles[-1]["close"]
+    for i in range(2,len(candles)-1):
+        age=len(candles)-1-i
+        if not 1<=age<=MAX_ZONE_AGE:continue
+        x,z=candles[i-2],candles[i]
+        if z["low"]>x["high"]: low,high,d=x["high"],z["low"],"BULLISH"
+        elif z["high"]<x["low"]:low,high,d=z["high"],x["low"],"BEARISH"
+        else:continue
+        mid=(low+high)/2; dist=abs(price-mid)/a; gap=(high-low)/a
+        if dist>MAX_ZONE_DISTANCE_ATR or gap<.05:continue
+        later=candles[i+1:-1]
+        full=any(c["low"]<=low for c in later) if d=="BULLISH" else any(c["high"]>=high for c in later)
+        partial=any(c["low"]<high for c in later) if d=="BULLISH" else any(c["high"]>low for c in later)
+        if full:continue
+        q=int(max(0,min(100,38+min(25,gap*30)+max(0,30-age)-dist*10-(10 if partial else 0))))
+        if q>=MIN_ZONE_QUALITY:out.append({"type":"FVG","direction":d,"low":low,"high":high,"midpoint":mid,"index":i,"age":age,"distance":dist,"quality":q,"partially_mitigated":partial})
+    return out
 
-    start = max(2, len(candles) - 9)
-    for i in range(start, len(candles)):
-        previous_close = candles[i - 1]["close"]
-        close = candles[i]["close"]
-        prior_highs = [x["price"] for x in highs if x["index"] < i]
-        prior_lows = [x["price"] for x in lows if x["index"] < i]
-        bullish_level = max(prior_highs) if prior_highs else None
-        bearish_level = min(prior_lows) if prior_lows else None
-
-        bullish_break = (
-            bullish_level is not None
-            and previous_close <= bullish_level
-            and close > bullish_level
-        )
-        bearish_break = (
-            bearish_level is not None
-            and previous_close >= bearish_level
-            and close < bearish_level
-        )
-
-        if bullish_break:
-            result["event_index"] = i
-            result["event_level"] = bullish_level
-            if trend == "BEARISH":
-                result.update(choch="BULLISH", bos="NONE", range_break="NONE")
-            elif trend == "RANGING":
-                result.update(range_break="BULLISH", bos="NONE", choch="NONE")
-            else:
-                result.update(bos="BULLISH", choch="NONE", range_break="NONE")
-
-        elif bearish_break:
-            result["event_index"] = i
-            result["event_level"] = bearish_level
-            if trend == "BULLISH":
-                result.update(choch="BEARISH", bos="NONE", range_break="NONE")
-            elif trend == "RANGING":
-                result.update(range_break="BEARISH", bos="NONE", choch="NONE")
-            else:
-                result.update(bos="BEARISH", choch="NONE", range_break="NONE")
-
-    return result
-
-def confirmed_structure_direction(structure):
-    if structure["bos"] != "NONE":
-        return structure["bos"]
-    if structure["choch"] != "NONE":
-        return structure["choch"]
+def order_block(candles,direction,a):
+    if a<=0 or direction not in ("BULLISH","BEARISH"):return None
+    price=candles[-1]["close"]
+    for i in range(len(candles)-2,max(0,len(candles)-MAX_ZONE_AGE-2),-1):
+        c=candles[i]; opposing=(direction=="BULLISH" and c["close"]<c["open"]) or (direction=="BEARISH" and c["close"]>c["open"])
+        if not opposing:continue
+        low,high=c["low"],c["high"]; mid=(low+high)/2; age=len(candles)-1-i; dist=abs(price-mid)/a
+        if age<1 or dist>MAX_ZONE_DISTANCE_ATR:continue
+        later=candles[i+1:-1]
+        invalid=any(x["low"]<low for x in later) if direction=="BULLISH" else any(x["high"]>high for x in later)
+        if invalid:continue
+        partial=any(x["low"]<high for x in later) if direction=="BULLISH" else any(x["high"]>low for x in later)
+        q=int(max(0,78-dist*12-age-(8 if partial else 0)))
+        if q>=MIN_ZONE_QUALITY:return {"type":"OB","direction":direction,"low":low,"high":high,"midpoint":mid,"index":i,"age":age,"distance":dist,"quality":q,"partially_mitigated":partial}
     return None
 
-# ============================================================
-# LIQUIDITY
-# ============================================================
+def choose_zone(candles,a,direction):
+    if direction not in ("BULLISH","BEARISH"):return None
+    zones=[z for z in fvg_zones(candles,a) if z["direction"]==direction]
+    ob=order_block(candles,direction,a)
+    if ob:zones.append(ob)
+    if not zones:return None
+    return sorted(zones,key=lambda z:(z["quality"],-z["distance"],-z["age"]),reverse=True)[0]
 
-def cluster_levels(levels, tolerance):
-    if not levels:
-        return []
-    levels = sorted(levels, key=lambda x: x["price"])
-    groups = []
-
-    for level in levels:
-        if not groups:
-            groups.append([level])
-            continue
-        center = median([x["price"] for x in groups[-1]])
-        if abs(level["price"] - center) <= tolerance:
-            groups[-1].append(level)
-        else:
-            groups.append([level])
-
-    output = []
-    for group in groups:
-        if len(group) >= 2:
-            prices = [x["price"] for x in group]
-            output.append({
-                "price": median(prices),
-                "touches": len(group),
-                "low": min(prices),
-                "high": max(prices),
-            })
-    return output
-
-def detect_liquidity(candles, atr):
-    highs, lows = find_swings(candles)
-    tolerance = max(atr * 0.12, 0.00001)
-    price = candles[-1]["close"]
-    buy = cluster_levels(highs, tolerance)
-    sell = cluster_levels(lows, tolerance)
-
-    def separate(levels):
-        nearby, distant = [], []
-        for level in levels:
-            distance = abs(level["price"] - price) / atr if atr > 0 else float("inf")
-            item = dict(level)
-            item["distance_atr"] = distance
-            (nearby if distance <= NEARBY_LIQUIDITY_ATR else distant).append(item)
-        nearby.sort(key=lambda x: x["distance_atr"])
-        distant.sort(key=lambda x: x["distance_atr"])
-        return nearby[:3], distant[:3]
-
-    buy_near, buy_far = separate(buy)
-    sell_near, sell_far = separate(sell)
-    return buy_near, buy_far, sell_near, sell_far
-
-# ============================================================
-# FAIR VALUE GAPS
-# ============================================================
-
-def detect_fvg(candles, atr):
-    zones = []
-    if atr <= 0:
-        return zones
-    current_price = candles[-1]["close"]
-
-    for i in range(2, len(candles) - 1):
-        age = len(candles) - 1 - i
-        if age < 1 or age > MAX_ZONE_AGE:
-            continue
-
-        first, third = candles[i - 2], candles[i]
-        if third["low"] > first["high"]:
-            low, high, direction = first["high"], third["low"], "BULLISH"
-        elif third["high"] < first["low"]:
-            low, high, direction = third["high"], first["low"], "BEARISH"
-        else:
-            continue
-
-        midpoint = (low + high) / 2
-        distance = abs(current_price - midpoint) / atr
-        gap_atr = (high - low) / atr
-        if distance > MAX_ZONE_DISTANCE_ATR or gap_atr < 0.08:
-            continue
-
-        previously_mitigated = any(
-            candle["low"] <= high and candle["high"] >= low
-            for candle in candles[i + 1:-1]
-        )
-        if previously_mitigated:
-            continue
-
-        distance_score = max(0, 35 - distance * 12)
-        size_score = min(30, gap_atr * 35)
-        freshness_score = max(0, 35 - age)
-        quality = int(min(100, distance_score + size_score + freshness_score))
-
-        if quality >= MIN_ZONE_QUALITY:
-            zones.append({
-                "type": "FVG",
-                "direction": direction,
-                "low": low,
-                "high": high,
-                "midpoint": midpoint,
-                "index": i,
-                "age": age,
-                "distance": distance,
-                "quality": quality,
-            })
-    return zones
-
-# ============================================================
-# ORDER BLOCK AND ZONE SELECTION
-# ============================================================
-
-def detect_order_block(candles, structure, atr):
-    direction = confirmed_structure_direction(structure)
-    if direction is None or atr <= 0:
-        return None
-
-    current_price = candles[-1]["close"]
-    start = max(1, len(candles) - 14)
-
-    for i in range(len(candles) - 2, start - 1, -1):
-        candle = candles[i]
-        opposing = (
-            direction == "BULLISH" and candle["close"] < candle["open"]
-        ) or (
-            direction == "BEARISH" and candle["close"] > candle["open"]
-        )
-        if not opposing:
-            continue
-
-        low, high = candle["low"], candle["high"]
-        midpoint = (low + high) / 2
-        distance = abs(current_price - midpoint) / atr
-        age = len(candles) - 1 - i
-
-        if age < 1 or age > MAX_ZONE_AGE or distance > MAX_ZONE_DISTANCE_ATR:
-            continue
-
-        previously_mitigated = any(
-            x["low"] <= high and x["high"] >= low
-            for x in candles[i + 1:-1]
-        )
-        if previously_mitigated:
-            continue
-
-        quality = int(max(0, 80 - distance * 15 - age))
-        if quality < MIN_ZONE_QUALITY:
-            continue
-
-        return {
-            "type": "OB",
-            "direction": direction,
-            "low": low,
-            "high": high,
-            "midpoint": midpoint,
-            "index": i,
-            "age": age,
-            "distance": distance,
-            "quality": quality,
-        }
-    return None
-
-def select_zone(candles, structure, atr, allowed_direction):
-    if allowed_direction not in ("BULLISH", "BEARISH"):
-        return None
-    zones = detect_fvg(candles, atr)
-    ob = detect_order_block(candles, structure, atr)
-    if ob:
-        zones.append(ob)
-    zones = [z for z in zones if z["direction"] == allowed_direction]
-    if not zones:
-        return None
-    zones.sort(
-        key=lambda z: (z["quality"], -z["distance"], -z["age"]),
-        reverse=True,
-    )
-    return zones[0]
-
-# ============================================================
-# RETEST AND REJECTION
-# ============================================================
-
-def validate_retest_rejection(candles, zone):
-    if zone is None:
-        return {"retest": False, "rejection": False, "valid": False}
-
-    if len(candles) - 1 <= zone["index"]:
-        return {"retest": False, "rejection": False, "valid": False}
-
-    last = candles[-1]
-    current_touches = last["low"] <= zone["high"] and last["high"] >= zone["low"]
-    if not current_touches:
-        return {"retest": False, "rejection": False, "valid": False}
-
-    candle_range = last["high"] - last["low"]
-    if candle_range <= 0:
-        return {"retest": True, "rejection": False, "valid": False}
-
-    body_ratio = abs(last["close"] - last["open"]) / candle_range
-    close_position = (last["close"] - last["low"]) / candle_range
-
-    if zone["direction"] == "BULLISH":
-        lower_wick = min(last["open"], last["close"]) - last["low"]
-        rejection = (
-            last["close"] > last["open"]
-            and close_position >= 0.65
-            and body_ratio >= 0.25
-            and lower_wick > candle_range * 0.20
-            and last["close"] > zone["midpoint"]
-        )
+def retest_rejection(candles,z):
+    if not z:return {"retest":False,"rejection":False}
+    c=candles[-1]; touched=c["low"]<=z["high"] and c["high"]>=z["low"]
+    if not touched:return {"retest":False,"rejection":False}
+    span=c["high"]-c["low"]
+    if span<=0:return {"retest":True,"rejection":False}
+    body=abs(c["close"]-c["open"])/span; pos=(c["close"]-c["low"])/span
+    if z["direction"]=="BULLISH":
+        wick=min(c["open"],c["close"])-c["low"]
+        ok=c["close"]>c["open"] and pos>=.60 and body>=.20 and wick>span*.15 and c["close"]>z["midpoint"]
     else:
-        upper_wick = last["high"] - max(last["open"], last["close"])
-        rejection = (
-            last["close"] < last["open"]
-            and close_position <= 0.35
-            and body_ratio >= 0.25
-            and upper_wick > candle_range * 0.20
-            and last["close"] < zone["midpoint"]
-        )
+        wick=c["high"]-max(c["open"],c["close"])
+        ok=c["close"]<c["open"] and pos<=.40 and body>=.20 and wick>span*.15 and c["close"]<z["midpoint"]
+    return {"retest":True,"rejection":bool(ok)}
 
-    return {"retest": True, "rejection": rejection, "valid": rejection}
-
-# ============================================================
-# CONFIRMED LIQUIDITY SWEEP
-# ============================================================
-
-def detect_confirmed_sweep(candles, structure):
-    highs, lows = structure["highs"], structure["lows"]
-    latest_index = len(candles) - 1
-    start = max(3, latest_index - MAX_SWEEP_AGE)
-
-    for i in range(latest_index - 1, start - 1, -1):
-        candle, follow = candles[i], candles[i + 1]
-        prior_highs = [x["price"] for x in highs if x["index"] <= i - 2]
-        prior_lows = [x["price"] for x in lows if x["index"] <= i - 2]
-
-        if prior_highs:
-            level = max(prior_highs[-3:])
-            swept = candle["high"] > level and candle["close"] < level
-            follow_through = follow["close"] < level and follow["close"] < follow["open"]
-            if swept and follow_through:
-                return {
-                    "type": "BUY-SIDE SWEEP",
-                    "direction": "BEARISH",
-                    "level": level,
-                    "index": i,
-                    "age": latest_index - i,
-                    "confirmed": True,
-                }
-
-        if prior_lows:
-            level = min(prior_lows[-3:])
-            swept = candle["low"] < level and candle["close"] > level
-            follow_through = follow["close"] > level and follow["close"] > follow["open"]
-            if swept and follow_through:
-                return {
-                    "type": "SELL-SIDE SWEEP",
-                    "direction": "BULLISH",
-                    "level": level,
-                    "index": i,
-                    "age": latest_index - i,
-                    "confirmed": True,
-                }
+def sweep_signal(candles,s):
+    hi,lo=s["highs"],s["lows"]; last=len(candles)-1
+    for i in range(last-1,max(2,last-MAX_SWEEP_AGE-1),-1):
+        c,f=candles[i],candles[i+1]; ph=[x["price"] for x in hi if x["index"]<=i-2]; pl=[x["price"] for x in lo if x["index"]<=i-2]
+        if ph:
+            level=ph[-1]
+            if c["high"]>level and c["close"]<level and f["close"]<level and f["close"]<f["open"]:
+                return {"type":"BUY-SIDE SWEEP","direction":"BEARISH","level":level,"age":last-i}
+        if pl:
+            level=pl[-1]
+            if c["low"]<level and c["close"]>level and f["close"]>level and f["close"]>f["open"]:
+                return {"type":"SELL-SIDE SWEEP","direction":"BULLISH","level":level,"age":last-i}
     return None
 
-# ============================================================
-# V12 POSITION SIZE CALCULATOR
-# ============================================================
+def cluster(levels,tol):
+    groups=[]
+    for x in sorted(levels,key=lambda y:y["price"]):
+        if not groups or abs(x["price"]-median([y["price"] for y in groups[-1]]))>tol:groups.append([x])
+        else:groups[-1].append(x)
+    return [{"price":median([x["price"] for x in g]),"touches":len(g)} for g in groups if len(g)>=2]
 
-def calculate_position_size(symbol, entry, stop):
-    risk_budget = ACCOUNT_BALANCE * RISK_PERCENT / 100
+def liquidity(candles,a):
+    hi,lo=swings(candles); price=candles[-1]["close"]; tol=max(a*.12,1e-8)
+    def split(items):
+        near,far=[],[]
+        for x in items:
+            d=abs(x["price"]-price)/a if a else float("inf"); y=dict(x,distance_atr=d)
+            (near if d<=LIQUIDITY_ATR else far).append(y)
+        near.sort(key=lambda q:q["distance_atr"]);far.sort(key=lambda q:q["distance_atr"])
+        return near[:3],far[:3]
+    bn,bf=split(cluster(hi,tol));sn,sf=split(cluster(lo,tol))
+    return bn,bf,sn,sf
 
-    def unavailable(reason):
-        return {
-            "available": False,
-            "lots": None,
-            "reason": reason,
-            "risk_amount": risk_budget,
-        }
-
-    if not math.isfinite(ACCOUNT_BALANCE) or ACCOUNT_BALANCE <= 0:
-        return unavailable("Invalid account balance.")
-    if not math.isfinite(RISK_PERCENT) or not 0 < RISK_PERCENT <= 100:
-        return unavailable("Risk percentage must be greater than 0 and no more than 100.")
-    if not math.isfinite(entry) or not math.isfinite(stop) or entry <= 0 or stop <= 0 or entry == stop:
-        return unavailable("Invalid entry or stop-loss price.")
-    if ACCOUNT_CURRENCY != "USD":
-        return unavailable("Only USD-denominated accounts are supported by this calculator.")
-
-    specs = BROKER_SPECS.get(symbol)
-    if not specs:
-        return unavailable("Broker specifications are not configured for this symbol.")
-
-    required = ("contract_size", "min_lot", "lot_step")
-    missing = [key for key in required if not specs.get(key)]
-    if missing:
-        env_names = {
-            "contract_size": {
-                "EUR/USD": "CONTRACT_SIZE_EURUSD",
-                "GBP/USD": "CONTRACT_SIZE_GBPUSD",
-                "USD/JPY": "CONTRACT_SIZE_USDJPY",
-                "XAU/USD": "CONTRACT_SIZE_XAUUSD",
-            },
-            "min_lot": {
-                "EUR/USD": "MIN_LOT_EURUSD",
-                "GBP/USD": "MIN_LOT_GBPUSD",
-                "USD/JPY": "MIN_LOT_USDJPY",
-                "XAU/USD": "MIN_LOT_XAUUSD",
-            },
-            "lot_step": {
-                "EUR/USD": "LOT_STEP_EURUSD",
-                "GBP/USD": "LOT_STEP_GBPUSD",
-                "USD/JPY": "LOT_STEP_USDJPY",
-                "XAU/USD": "LOT_STEP_XAUUSD",
-            },
-        }
-        names = [env_names[key][symbol] for key in missing]
-        return unavailable("Missing broker settings: " + ", ".join(names))
-
+def position_size(symbol,entry,stop):
+    budget=ACCOUNT_BALANCE*RISK_PERCENT/100
+    def no(reason):return {"available":False,"lots":None,"reason":reason,"risk_amount":budget}
+    if ACCOUNT_CURRENCY!="USD":return no("Only USD accounts are supported by this calculator.")
+    specs=BROKER.get(symbol,())
+    if len(specs)<3 or any(not x for x in specs[:3]):return no("Missing exact Exness contract size, minimum lot or lot step.")
     try:
-        contract_size = float(specs["contract_size"])
-        min_lot = float(specs["min_lot"])
-        lot_step = float(specs["lot_step"])
-        max_lot = float(specs["max_lot"]) if specs.get("max_lot") else None
-    except (TypeError, ValueError):
-        return unavailable("Broker specifications must contain valid numbers.")
+        contract,minlot,step=map(float,specs[:3]);maxlot=float(specs[3]) if specs[3] else None
+    except ValueError:return no("Broker specifications must be numeric.")
+    vals=[contract,minlot,step]+([maxlot] if maxlot else [])
+    if not all(math.isfinite(x) and x>0 for x in vals):return no("Broker specifications must be positive.")
+    conversion=1/entry if symbol=="USD/JPY" else 1.0
+    per_lot=abs(entry-stop)*contract*conversion
+    if per_lot<=0 or not math.isfinite(per_lot):return no("Invalid monetary risk calculation.")
+    lots=math.floor((budget/per_lot+1e-12)/step)*step
+    if maxlot is not None:lots=min(lots,math.floor((maxlot+1e-12)/step)*step)
+    lots=round(lots,8)
+    if lots<minlot:return no(f"Risk-sized volume is below broker minimum ({minlot}).")
+    risk=lots*per_lot
+    if risk>budget+1e-6:return no("Rounded lot size exceeds risk budget.")
+    return {"available":True,"lots":lots,"estimated_risk":risk,"risk_amount":budget,"conversion_note":"USD/JPY conversion estimated using entry price." if symbol=="USD/JPY" else "USD quote currency; 1:1 conversion."}
 
-    numeric_values = [contract_size, min_lot, lot_step]
-    if max_lot is not None:
-        numeric_values.append(max_lot)
-    if not all(math.isfinite(x) and x > 0 for x in numeric_values):
-        return unavailable("Broker specification values must be positive finite numbers.")
+def levels(symbol,direction,entry,z,a,candles):
+    if not z or a<=0 or entry<=0:return None
+    stop=min(z["low"],candles[-1]["low"])-a*STOP_BUFFER_ATR if direction=="BUY" else max(z["high"],candles[-1]["high"])+a*STOP_BUFFER_ATR
+    risk=entry-stop if direction=="BUY" else stop-entry; rat=risk/a
+    if risk<=0 or not MIN_STOP_ATR<=rat<=MAX_STOP_ATR:return None
+    sign=1 if direction=="BUY" else -1
+    return {"direction":direction,"entry":entry,"stop":stop,"risk":risk,"risk_atr":rat,
+            "tp1":entry+sign*risk*TP_R[0],"tp2":entry+sign*risk*TP_R[1],"tp3":entry+sign*risk*TP_R[2],
+            "position_size":position_size(symbol,entry,stop)}
 
-    # Quote-currency conversion into the USD account currency.
-    if symbol in ("EUR/USD", "GBP/USD", "XAU/USD"):
-        conversion = 1.0
-        conversion_note = "USD quote currency; 1:1 conversion."
-    elif symbol == "USD/JPY":
-        conversion = 1.0 / entry
-        conversion_note = "JPY-to-USD conversion estimated using entry price."
-    else:
-        return unavailable("No quote-to-account currency conversion is configured.")
+def evaluate(symbol,h1,m15,hmeta,mmeta):
+    hs,ms=structure(h1),structure(m15); a=atr(m15); price=m15[-1]["close"]
+    hd,md=hs["direction"],ms["direction"]; aligned=hd in ("BULLISH","BEARISH") and hd==md
+    event=structure_event(ms)
+    # Discover directional candidates before all confirmation gates are met.
+    direction=hd if aligned else md if md in ("BULLISH","BEARISH") else event or (ms["range_break"] if ms["range_break"]!="NONE" else None)
+    z=choose_zone(m15,a,direction); ret=retest_rejection(m15,z); sw=sweep_signal(m15,ms)
+    structure_ok=bool(event and event==direction); zone_ok=bool(z and z["direction"]==direction)
+    sweep_ok=bool(sw and sw["direction"]==direction)
+    candidate=None
+    if zone_ok:candidate=levels(symbol,"BUY" if direction=="BULLISH" else "SELL",z["midpoint"],z,a,m15)
+    confirmed=all([aligned,structure_ok,zone_ok,ret["retest"],ret["rejection"],sweep_ok])
+    confirmed_plan=levels(symbol,"BUY" if direction=="BULLISH" else "SELL",price,z,a,m15) if confirmed else None
+    if confirmed_plan:status="CONFIRMED "+confirmed_plan["direction"];plan=confirmed_plan;is_confirmed=True
+    elif candidate:status="PROPOSED "+candidate["direction"];plan=candidate;is_confirmed=False
+    else:status="WATCHLIST" if direction else "NO SETUP";plan=None;is_confirmed=False
+    missing=[]
+    for ok,label in [(aligned,"H1/M15 trend alignment"),(structure_ok,"M15 BOS/CHOCH in candidate direction"),(zone_ok,"fresh aligned FVG/order block"),(ret["retest"],"zone retest"),(ret["rejection"],"rejection candle"),(sweep_ok,"fresh matching liquidity sweep")]:
+        if not ok:missing.append(label)
+    if zone_ok and plan is None:missing.append("valid stop distance / trade levels")
+    score=(20 if aligned else 0)+(20 if structure_ok else 0)+(15 if zone_ok else 0)+(10 if ret["retest"] else 0)+(15 if ret["rejection"] else 0)+(20 if sweep_ok else 0)
+    watch=(15 if hd!="RANGING" else 0)+(15 if md!="RANGING" else 0)+(min(30,int(z["quality"]*.3)) if z else 0)+(20 if structure_ok else 0)+(20 if aligned else 0)+(10 if sweep_ok else 0)
+    bn,bf,sn,sf=liquidity(m15,a)
+    return {"symbol":symbol,"price":price,"atr":a,"status":status,"h1":hs,"m15":ms,"zone":z,"retest":ret,"sweep":sw,
+            "aligned":aligned,"watch_score":min(100,watch),"entry_score":score,"entry_valid":is_confirmed,
+            "proposed":status.startswith("PROPOSED"),"levels":plan,"missing":missing,"buy_near":bn,"buy_far":bf,
+            "sell_near":sn,"sell_far":sf,"h1_meta":hmeta,"m15_meta":mmeta}
 
-    price_distance = abs(entry - stop)
-    risk_per_lot = price_distance * contract_size * conversion
-    if not math.isfinite(risk_per_lot) or risk_per_lot <= 0:
-        return unavailable("Could not calculate monetary risk per lot.")
+def fmt(x,s):
+    if x is None:return "N/A"
+    return f"{x:.{3 if 'JPY' in s else 2 if 'XAU' in s else 5}f}"
 
-    raw_lots = risk_budget / risk_per_lot
+def liq_text(xs,s):
+    return ", ".join(f"{fmt(x['price'],s)} ({x['touches']} touches)" for x in xs) if xs else "None"
 
-    # Round DOWN to the broker's configured lot increment.
-    lots = math.floor((raw_lots + 1e-12) / lot_step) * lot_step
-
-    if max_lot is not None and lots > max_lot:
-        lots = math.floor((max_lot + 1e-12) / lot_step) * lot_step
-
-    lots = round(lots, 8)
-
-    if lots < min_lot:
-        return unavailable(
-            f"Risk-based size is below the broker minimum ({min_lot} lots). "
-            "No safe lot recommendation can be made at this risk setting."
-        )
-
-    estimated_risk = lots * risk_per_lot
-    if estimated_risk > risk_budget + 0.000001:
-        return unavailable("Rounded position size would exceed the risk budget.")
-
-    return {
-        "available": True,
-        "lots": lots,
-        "risk_amount": risk_budget,
-        "risk_per_lot": risk_per_lot,
-        "estimated_risk": estimated_risk,
-        "risk_percent": RISK_PERCENT,
-        "contract_size": contract_size,
-        "min_lot": min_lot,
-        "lot_step": lot_step,
-        "max_lot": max_lot,
-        "conversion": conversion,
-        "conversion_note": conversion_note,
-    }
-
-# ============================================================
-# V12 TRADE LEVELS
-# ============================================================
-
-def calculate_levels(candles, zone, atr, symbol):
-    if not zone or atr <= 0:
-        return None
-
-    last = candles[-1]
-    entry = last["close"]
-
-    if zone["direction"] == "BULLISH":
-        stop = min(zone["low"], last["low"]) - atr * STOP_BUFFER_ATR
-        risk = entry - stop
-        if risk <= 0:
-            return None
-        direction = "BUY"
-        tp1, tp2, tp3 = entry + risk * TP1_R, entry + risk * TP2_R, entry + risk * TP3_R
-
-    elif zone["direction"] == "BEARISH":
-        stop = max(zone["high"], last["high"]) + atr * STOP_BUFFER_ATR
-        risk = stop - entry
-        if risk <= 0:
-            return None
-        direction = "SELL"
-        tp1, tp2, tp3 = entry - risk * TP1_R, entry - risk * TP2_R, entry - risk * TP3_R
-    else:
-        return None
-
-    risk_atr = risk / atr
-    if risk_atr < MIN_STOP_ATR or risk_atr > MAX_STOP_ATR:
-        return None
-
-    position_size = calculate_position_size(symbol, entry, stop)
-
-    return {
-        "direction": direction,
-        "entry": entry,
-        "stop": stop,
-        "risk": risk,
-        "risk_atr": risk_atr,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rr1": TP1_R,
-        "rr2": TP2_R,
-        "rr3": TP3_R,
-        "entry_candle_time": last["time"],
-        "position_size": position_size,
-    }
-
-# ============================================================
-# EVALUATION
-# ============================================================
-
-def evaluate(symbol, h1, m15, h1_meta, m15_meta):
-    h1_structure = analyse_structure(h1)
-    m15_structure = analyse_structure(m15)
-    atr = calculate_atr(m15)
-    price = m15[-1]["close"]
-
-    h1_direction = h1_structure["direction"]
-    m15_direction = m15_structure["direction"]
-    aligned = (
-        h1_direction in ("BULLISH", "BEARISH")
-        and h1_direction == m15_direction
-    )
-
-    zone = select_zone(m15, m15_structure, atr, h1_direction)
-    retest = validate_retest_rejection(m15, zone)
-    sweep = detect_confirmed_sweep(m15, m15_structure)
-    structure_direction = confirmed_structure_direction(m15_structure)
-
-    structure_confirmed = (
-        structure_direction is not None
-        and structure_direction == h1_direction
-        and aligned
-    )
-    zone_confirmed = zone is not None and zone["direction"] == h1_direction
-    sweep_confirmed = sweep is not None and sweep["direction"] == h1_direction
-
-    entry_score = 0
-    if aligned:
-        entry_score += 20
-    if structure_confirmed:
-        entry_score += 20
-    if zone_confirmed:
-        entry_score += 15
-    if retest["retest"]:
-        entry_score += 10
-    if retest["rejection"]:
-        entry_score += 15
-    if sweep_confirmed:
-        entry_score += 20
-
-    entry_conditions = all([
-        aligned,
-        structure_confirmed,
-        zone_confirmed,
-        retest["retest"],
-        retest["rejection"],
-        sweep_confirmed,
-        entry_score >= MIN_ENTRY_SCORE,
-    ])
-
-    levels = None
-    entry_valid = False
-    level_rejection_reason = None
-
-    if entry_conditions:
-        levels = calculate_levels(m15, zone, atr, symbol)
-        if levels is not None:
-            entry_valid = True
-        else:
-            level_rejection_reason = "Trade rejected: invalid or excessive stop distance."
-
-    watch_score = 0
-    if h1_direction != "RANGING":
-        watch_score += 15
-    if m15_direction != "RANGING":
-        watch_score += 15
-    if zone:
-        watch_score += min(25, int(zone["quality"] * 0.25))
-    if sweep:
-        watch_score += 10
-    if structure_direction:
-        watch_score += 20
-    if aligned:
-        watch_score += 15
-
-    if entry_valid:
-        status = "CONFIRMED ENTRY CONDITIONS"
-    elif watch_score >= 20:
-        status = "WATCHLIST"
-    else:
-        status = "NO SETUP"
-
-    buy_near, buy_far, sell_near, sell_far = detect_liquidity(m15, atr)
-
-    return {
-        "symbol": symbol,
-        "price": price,
-        "atr": atr,
-        "status": status,
-        "h1": h1_structure,
-        "m15": m15_structure,
-        "zone": zone,
-        "retest": retest,
-        "sweep": sweep,
-        "aligned": aligned,
-        "watch_score": min(100, watch_score),
-        "entry_score": entry_score,
-        "entry_valid": entry_valid,
-        "levels": levels,
-        "level_rejection_reason": level_rejection_reason,
-        "buy_near": buy_near,
-        "buy_far": buy_far,
-        "sell_near": sell_near,
-        "sell_far": sell_far,
-        "h1_meta": h1_meta,
-        "m15_meta": m15_meta,
-    }
-
-# ============================================================
-# FORMATTING
-# ============================================================
-
-def fmt(value, symbol):
-    if value is None:
-        return "N/A"
-    digits = 3 if "JPY" in symbol else 2 if "XAU" in symbol else 5
-    return f"{value:.{digits}f}"
-
-def liquidity_text(levels, symbol):
-    if not levels:
-        return "None"
-    return ", ".join(
-        f"{fmt(x['price'], symbol)} ({x['touches']} touches)"
-        for x in levels
-    )
-
-def format_trade_plan(result):
-    symbol = result["symbol"]
-    lv = result["levels"]
-    sizing = lv["position_size"]
-    direction_emoji = "ð¢" if lv["direction"] == "BUY" else "ð´"
-
-    lines = [
-        "ââââââââââââââââââ",
-        f"{direction_emoji} {lv['direction']} {symbol}",
-        "ð¨ ENTRY CONDITIONS CONFIRMED",
-        "ââââââââââââââââââ",
-        "",
-        f"Entry reference: {fmt(lv['entry'], symbol)}",
-        f"Stop Loss: {fmt(lv['stop'], symbol)}",
-        "",
-        f"Take Profit 1: {fmt(lv['tp1'], symbol)} (1:1)",
-        f"Take Profit 2: {fmt(lv['tp2'], symbol)} (1:2)",
-        f"Take Profit 3: {fmt(lv['tp3'], symbol)} (1:3)",
-        "",
-        f"Stop distance: {fmt(lv['risk'], symbol)}",
-        f"Stop distance (ATR): {lv['risk_atr']:.2f} ATR",
-        "",
-        "ââââââââââââââââââ",
-        "ð° POSITION SIZE AND RISK",
-        f"Account balance: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE:,.2f}",
-        f"Account risk: {RISK_PERCENT:.2f}%",
-        f"Risk budget: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE * RISK_PERCENT / 100:,.2f}",
-    ]
-
-    if sizing["available"]:
-        lines.extend([
-            f"Recommended lot size: {sizing['lots']:.8f}",
-            f"Estimated monetary risk: {ACCOUNT_CURRENCY} {sizing['estimated_risk']:.2f}",
-            f"Configured contract size: {sizing['contract_size']:,.4f}",
-            sizing["conversion_note"],
-        ])
-    else:
-        lines.extend([
-            "â ï¸ LOT SIZE NOT AVAILABLE",
-            sizing["reason"],
-            "Do not guess or manually increase the lot size.",
-            "Configure the missing broker specifications first.",
-        ])
-
-    lines.extend([
-        "",
-        "ââââââââââââââââââ",
-        f"H1 direction: {result['h1']['direction']}",
-        f"M15 direction: {result['m15']['direction']}",
-        f"BOS: {result['m15']['bos']}",
-        f"CHOCH: {result['m15']['choch']}",
-        f"Zone: {result['zone']['type']} {result['zone']['direction']}",
-        f"Zone quality: {result['zone']['quality']}/100",
-        f"Retest: {'YES' if result['retest']['retest'] else 'NO'}",
-        f"Rejection: {'YES' if result['retest']['rejection'] else 'NO'}",
-        f"Sweep: {result['sweep']['type']}",
-        f"Sweep age: {result['sweep']['age']} M15 candles",
-        "",
-        "Entry reference uses the completed M15 candle close.",
-        "Actual loss may differ due to spread, commission, slippage and conversion changes.",
-        "Check live price before execution. Do not chase a missed entry.",
-        "Alert only â no automatic trading.",
-        "ââââââââââââââââââ",
-    ])
+def plan_message(r,confirmed):
+    p,z,s=r["levels"],r["zone"],r["symbol"]; sizing=p["position_size"]
+    lines=[f"ð¤ ODJ AI SMART TRADER {VERSION}",f"{'ð¢' if p['direction']=='BUY' else 'ð´'} {'CONFIRMED' if confirmed else 'PROPOSED â WAIT FOR CONFIRMATION'} {p['direction']} â {s}",
+           f"Entry reference: {fmt(p['entry'],s)}",f"Stop Loss: {fmt(p['stop'],s)}",
+           f"TP1: {fmt(p['tp1'],s)} (1R)",f"TP2: {fmt(p['tp2'],s)} (2R)",f"TP3: {fmt(p['tp3'],s)} (3R)",
+           f"Stop distance: {fmt(p['risk'],s)} | {p['risk_atr']:.2f} ATR",
+           f"Account: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE:,.2f} | risk budget: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE*RISK_PERCENT/100:.2f} ({RISK_PERCENT:.2f}%)"]
+    if sizing["available"]:lines.append(f"Risk-sized lot: {sizing['lots']:.8f} | estimated risk: {ACCOUNT_CURRENCY} {sizing['estimated_risk']:.2f} | {sizing['conversion_note']}")
+    else:lines.append("LOT SIZE NOT AVAILABLE: "+sizing["reason"])
+    lines += [f"H1 {r['h1']['direction']} | M15 {r['m15']['direction']}",f"Zone: {z['type']} {z['direction']} {fmt(z['low'],s)}â{fmt(z['high'],s)} | quality {z['quality']}/100",
+              f"Retest: {'YES' if r['retest']['retest'] else 'NO'} | rejection: {'YES' if r['retest']['rejection'] else 'NO'}",
+              f"Sweep: {r['sweep']['type'] if r['sweep'] else 'NOT CONFIRMED'}"]
+    if not confirmed:lines += ["Still required:"]+["- "+x for x in r["missing"]]+["Candidate reference only; NOT a confirmed entry or filled order."]
+    else:lines.append("Entry reference uses completed M15 close. Check live price, spread and slippage; do not chase.")
+    lines.append("Alert only â no automatic trading. Prices are references, not guaranteed fills.")
     return "\n".join(lines)
 
 def format_result(r):
-    symbol = r["symbol"]
-    h1, m15, zone, sweep = r["h1"], r["m15"], r["zone"], r["sweep"]
-
-    lines = [
-        f"{symbol} â {r['status']}",
-        f"H1 {h1['direction']} | M15 {m15['direction']}",
-        f"BOS {m15['bos']} | CHOCH {m15['choch']} | RANGE BREAK {m15['range_break']}",
-        f"Price {fmt(r['price'], symbol)}",
-        f"Watchlist {r['watch_score']}/100 | Entry {r['entry_score']}/100",
-        (
-            "H1 candle ended: "
-            f"{r['h1_meta']['latest_candle_close'].strftime('%Y-%m-%d %H:%M UTC')} "
-            f"| Data age: {r['h1_meta']['data_age_minutes']:.1f} min"
-        ),
-        (
-            "M15 candle ended: "
-            f"{r['m15_meta']['latest_candle_close'].strftime('%Y-%m-%d %H:%M UTC')} "
-            f"| Data age: {r['m15_meta']['data_age_minutes']:.1f} min"
-        ),
-    ]
-
-    if zone:
-        lines.extend([
-            (
-                f"Aligned zone {zone['type']} {zone['direction']} "
-                f"{fmt(zone['low'], symbol)}â{fmt(zone['high'], symbol)} | "
-                f"Quality {zone['quality']}/100 | Age {zone['age']} | "
-                f"Distance {zone['distance']:.2f} ATR"
-            ),
-            f"Retest: {'YES' if r['retest']['retest'] else 'NO'} | "
-            f"Rejection: {'YES' if r['retest']['rejection'] else 'NO'}",
-        ])
-    else:
-        lines.append("Zone: No fresh qualifying zone aligned with H1 direction")
-
-    if sweep:
-        lines.append(
-            f"Sweep: {sweep['type']} at {fmt(sweep['level'], symbol)} "
-            f"â CONFIRMED | Age {sweep['age']} M15 candles"
-        )
-    else:
-        lines.append("Confirmed fresh liquidity sweep: None")
-
-    lines.extend([
-        "Nearby buy-side liquidity (within 3 ATR): " + liquidity_text(r["buy_near"], symbol),
-        "Distant buy-side liquidity (over 3 ATR): " + liquidity_text(r["buy_far"], symbol),
-        "Nearby sell-side liquidity (within 3 ATR): " + liquidity_text(r["sell_near"], symbol),
-        "Distant sell-side liquidity (over 3 ATR): " + liquidity_text(r["sell_far"], symbol),
-    ])
-
-    if r["entry_valid"] and r["levels"]:
-        lv = r["levels"]
-        sizing = lv["position_size"]
-        lines.extend([
-            "",
-            "ENTRY CONDITIONS CONFIRMED",
-            f"Direction: {lv['direction']}",
-            f"Entry: {fmt(lv['entry'], symbol)}",
-            f"SL: {fmt(lv['stop'], symbol)}",
-            f"TP1: {fmt(lv['tp1'], symbol)}",
-            f"TP2: {fmt(lv['tp2'], symbol)}",
-            f"TP3: {fmt(lv['tp3'], symbol)}",
-            "Risk/reward: 1:1 | 1:2 | 1:3",
-            f"Risk budget: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE * RISK_PERCENT / 100:.2f}",
-        ])
-        if sizing["available"]:
-            lines.append(
-                f"Recommended lot: {sizing['lots']:.8f} | "
-                f"Estimated risk: {ACCOUNT_CURRENCY} {sizing['estimated_risk']:.2f}"
-            )
-        else:
-            lines.append("LOT SIZE NOT AVAILABLE: " + sizing["reason"])
-    else:
-        lines.append("No entry alert. Wait for every condition to confirm.")
-        if r.get("level_rejection_reason"):
-            lines.append(r["level_rejection_reason"])
-
+    s=r["symbol"];h,m,z=r["h1"],r["m15"],r["zone"]
+    lines=[f"{s} â {r['status']}",f"H1 {h['direction']} | M15 {m['direction']}",
+           f"BOS {m['bos']} | CHOCH {m['choch']} | RANGE BREAK {m['range_break']}",
+           f"Price {fmt(r['price'],s)} | Watch {r['watch_score']}/100 | Entry conditions {r['entry_score']}/100",
+           f"H1 ended {r['h1_meta']['latest_candle_close'].strftime('%Y-%m-%d %H:%M UTC')} | age {r['h1_meta']['data_age_minutes']:.1f}m",
+           f"M15 ended {r['m15_meta']['latest_candle_close'].strftime('%Y-%m-%d %H:%M UTC')} | age {r['m15_meta']['data_age_minutes']:.1f}m"]
+    if z:lines += [f"Zone {z['type']} {z['direction']} {fmt(z['low'],s)}â{fmt(z['high'],s)} | quality {z['quality']}/100 | age {z['age']} | distance {z['distance']:.2f} ATR",
+                   f"Retest {'YES' if r['retest']['retest'] else 'NO'} | rejection {'YES' if r['retest']['rejection'] else 'NO'}"]
+    else:lines.append("No qualifying zone for candidate direction.")
+    lines.append("Sweep: "+(f"{r['sweep']['type']} at {fmt(r['sweep']['level'],s)}" if r["sweep"] else "None confirmed"))
+    lines += ["Nearby buy-side liquidity: "+liq_text(r["buy_near"],s),"Nearby sell-side liquidity: "+liq_text(r["sell_near"],s)]
+    if r["levels"]:
+        p=r["levels"];lines.append(f"Entry {fmt(p['entry'],s)} | SL {fmt(p['stop'],s)} | TP1 {fmt(p['tp1'],s)} | TP2 {fmt(p['tp2'],s)} | TP3 {fmt(p['tp3'],s)}")
+        lines.append("PROPOSED ONLY â wait for confirmations." if r["proposed"] else "CONFIRMED CONDITIONS â separate alert follows.")
+    if r["missing"]:lines.append("Missing: "+", ".join(r["missing"]))
     return "\n".join(lines)
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
 def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing Telegram configuration")
+    if not BOT_TOKEN or not CHAT_ID:raise RuntimeError("Missing Telegram configuration")
+    r=requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":message,"disable_web_page_preview":True},timeout=25)
+    r.raise_for_status();data=r.json()
+    if not data.get("ok"):raise RuntimeError(f"Telegram rejected message: {data}")
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    response = requests.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True,
-        },
-        timeout=25,
-    )
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram rejected message: {result}")
-
-def send_long_message(message):
-    chunks, current = [], ""
+def send_long(message):
+    chunks=[];buf=""
     for line in message.splitlines():
-        if len(current) + len(line) + 1 > 3900:
-            if current:
-                chunks.append(current)
-            current = ""
-        current += line + "\n"
-    if current:
-        chunks.append(current)
-    for chunk in chunks:
-        send_telegram(chunk)
+        if len(buf)+len(line)+1>3900:
+            if buf:chunks.append(buf)
+            buf=""
+        buf+=line+"\n"
+    if buf:chunks.append(buf)
+    for part in chunks:send_telegram(part)
 
-# ============================================================
-# PERSISTENT DUPLICATE ALERT PROTECTION
-# ============================================================
+def gh_headers():
+    return {"Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"}
 
-def github_headers():
-    return {
-        "Authorization": f"Bearer {GH_ALERT_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+def state_url():
+    return f"https://api.github.com/repos/{REPO}/contents/{STATE_FILE}" if REPO else None
 
-def github_state_url():
-    if not GITHUB_REPOSITORY:
-        return None
-    return f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{STATE_FILE}"
-
-def load_alert_state():
-    if not GH_ALERT_TOKEN or not GITHUB_REPOSITORY:
-        print("WARNING: GH_ALERT_TOKEN not configured. Persistent duplicate protection is disabled.")
-        return {"alerts": {}}, None, False
-
+def load_state():
+    if not GH_TOKEN or not REPO:
+        print("WARNING: persistent duplicate protection disabled.");return {"alerts":{}},None,False
     try:
-        response = requests.get(github_state_url(), headers=github_headers(), timeout=20)
-        if response.status_code == 404:
-            return {"alerts": {}}, None, True
-        response.raise_for_status()
-        data = response.json()
-        raw = base64.b64decode(data["content"].replace("\n", "")).decode("utf-8")
-        state = json.loads(raw)
-        if not isinstance(state, dict):
-            state = {}
-        if not isinstance(state.get("alerts"), dict):
-            state["alerts"] = {}
-        return state, data.get("sha"), True
-    except Exception as error:
-        print(f"WARNING: Could not load GitHub alert state: {error}")
-        return {"alerts": {}}, None, False
+        r=requests.get(state_url(),headers=gh_headers(),timeout=20)
+        if r.status_code==404:return {"alerts":{}},None,True
+        r.raise_for_status();d=r.json();state=json.loads(base64.b64decode(d["content"].replace("\n","")).decode())
+        if not isinstance(state,dict):state={}
+        if not isinstance(state.get("alerts"),dict):state["alerts"]={}
+        return state,d.get("sha"),True
+    except Exception as e:
+        print("WARNING: cannot load alert state:",e);return {"alerts":{}},None,False
 
-def save_alert_state(state, sha):
-    if not GH_ALERT_TOKEN or not GITHUB_REPOSITORY:
-        return False
+def save_state(state,sha):
     try:
-        raw = json.dumps(state, indent=2, sort_keys=True)
-        encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
-        payload = {
-            "message": "Update ODJ Smart Trader V12 alert state",
-            "content": encoded,
-        }
-        if sha:
-            payload["sha"] = sha
-        response = requests.put(
-            github_state_url(),
-            headers=github_headers(),
-            json=payload,
-            timeout=25,
-        )
-        response.raise_for_status()
-        print("Persistent alert state saved to GitHub.")
-        return True
-    except Exception as error:
-        print(f"WARNING: Could not save GitHub alert state: {error}")
-        return False
+        raw=base64.b64encode(json.dumps(state,indent=2,sort_keys=True).encode()).decode()
+        payload={"message":f"Update ODJ Smart Trader {VERSION} alert state","content":raw}
+        if sha:payload["sha"]=sha
+        r=requests.put(state_url(),headers=gh_headers(),json=payload,timeout=25);r.raise_for_status()
+        print("Persistent alert state saved.");return True
+    except Exception as e:print("WARNING: cannot save alert state:",e);return False
 
-def alert_signature(result):
-    zone, sweep, symbol = result["zone"], result["sweep"], result["symbol"]
-    digits = 3 if "JPY" in symbol else 2 if "XAU" in symbol else 5
-    return "|".join([
-        symbol,
-        zone["direction"],
-        zone["type"],
-        str(round(zone["low"], digits)),
-        str(round(zone["high"], digits)),
-        str(round(sweep["level"], digits)),
-    ])
+def alert_signature(r,kind):
+    z,s=r["zone"],r["symbol"];digits=3 if "JPY" in s else 2 if "XAU" in s else 5
+    return "|".join([kind,s,z["direction"],z["type"],str(round(z["low"],digits)),str(round(z["high"],digits))])
 
-def prepare_entry_alerts(results, state, persistence_available):
-    alerts = []
-    stored = state.get("alerts", {})
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=ALERT_STATE_DAYS)
-    cleaned = {}
-
-    for signature, timestamp in stored.items():
-        alert_time = parse_time(timestamp)
-        if alert_time and alert_time >= cutoff:
-            cleaned[signature] = timestamp
-    stored = cleaned
-
-    for result in results:
-        if not result.get("entry_valid"):
-            continue
-        signature = alert_signature(result)
-        if persistence_available and signature in stored:
-            print(f"Duplicate alert suppressed: {result['symbol']}")
-            continue
-        alert = f"ð¤ ODJ AI SMART TRADER {VERSION}\n" + format_trade_plan(result)
-        alerts.append({"signature": signature, "message": alert})
-
-    return alerts, stored
-
-# ============================================================
-# MAIN
-# ============================================================
+def prepare_alerts(results,state,persist):
+    cutoff=datetime.now(timezone.utc)-timedelta(days=30);stored={}
+    for sig,stamp in state.get("alerts",{}).items():
+        t=parse_time(stamp)
+        if t and t>=cutoff:stored[sig]=stamp
+    alerts=[]
+    for r in results:
+        if "error" in r or not r.get("levels"):continue
+        kind="CONFIRMED" if r["entry_valid"] else "PROPOSED";sig=alert_signature(r,kind)
+        if persist and sig in stored:continue
+        alerts.append({"signature":sig,"message":plan_message(r,r["entry_valid"])})
+    return alerts,stored
 
 def main():
-    if not API_KEY:
-        raise RuntimeError("Twelve Data API key missing")
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Telegram credentials missing")
-    if ACCOUNT_BALANCE <= 0:
-        raise RuntimeError("ACCOUNT_BALANCE must be greater than zero.")
-    if not 0 < RISK_PERCENT <= 100:
-        raise RuntimeError("RISK_PERCENT must be greater than 0 and no more than 100.")
-
-    scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    results = []
-
+    if not API_KEY:raise RuntimeError("Twelve Data API key missing")
+    if not BOT_TOKEN or not CHAT_ID:raise RuntimeError("Telegram credentials missing")
+    if not math.isfinite(ACCOUNT_BALANCE) or ACCOUNT_BALANCE<=0 or not 0<RISK_PERCENT<=100:raise RuntimeError("Check account balance and risk percentage.")
+    scan=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC");results=[]
     for symbol in SYMBOLS:
         try:
-            print(f"Scanning {symbol}")
-            h1, h1_meta = fetch_candles(symbol, "H1")
-            time.sleep(REQUEST_DELAY)
-            m15, m15_meta = fetch_candles(symbol, "M15")
-            time.sleep(REQUEST_DELAY)
-
-            result = evaluate(symbol, h1, m15, h1_meta, m15_meta)
-            results.append(result)
-            print(f"{symbol}: {result['status']} | Entry score {result['entry_score']}")
-        except Exception as error:
-            print(f"ERROR {symbol}: {error}")
-            results.append({"symbol": symbol, "error": str(error)})
-
-    report = [
-        f"ð¤ ODJ AI SMART TRADER {VERSION}",
-        f"Scan: {scan_time}",
-        "Mode: ALERT ONLY â NO AUTOMATIC TRADING",
-        "Verified completed H1 and M15 candles",
-        "H1 maximum data age: 180 minutes",
-        "M15 maximum data age: 45 minutes",
-        "Strict direction-aligned zone validation",
-        "Fresh sweep limit: 4 completed M15 candles",
-        "Nearby / distant liquidity classification",
-        "V12 trade levels and configurable position sizing enabled",
-        f"Account: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE:,.2f} | Risk: {RISK_PERCENT:.2f}%",
-        f"Risk budget per trade: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE * RISK_PERCENT / 100:,.2f}",
-        "TP1 = 1:1 | TP2 = 1:2 | TP3 = 1:3",
-        f"Maximum stop distance: {MAX_STOP_ATR} ATR",
-        "",
-    ]
-
-    for result in results:
-        if "error" in result:
-            report.append(f"{result['symbol']} â SCAN ERROR\n{result['error']}")
-        else:
-            report.append(format_result(result))
-        report.append("------------------------")
-
-    report.append(
-        "Entry alerts require H1/M15 alignment, BOS/CHOCH, a fresh "
-        "direction-aligned zone, current-candle retest, rejection and "
-        "a fresh confirmed liquidity sweep. Trade levels are references, "
-        "not guaranteed fills. Lot sizing requires configured broker specs."
-    )
-
-    send_long_message("\n".join(report))
-
-    state, sha, persistence_available = load_alert_state()
-    alerts, stored = prepare_entry_alerts(results, state, persistence_available)
-    successfully_sent = []
-
+            print("Scanning",symbol);h1,hm=fetch_candles(symbol,"H1");time.sleep(REQUEST_DELAY)
+            m15,mm=fetch_candles(symbol,"M15");time.sleep(REQUEST_DELAY)
+            r=evaluate(symbol,h1,m15,hm,mm);results.append(r);print(symbol,r["status"],"score",r["entry_score"])
+        except Exception as e:print("ERROR",symbol,e);results.append({"symbol":symbol,"error":str(e)})
+    report=[f"ð¤ ODJ AI SMART TRADER {VERSION}",f"Scan: {scan}","ALERT ONLY â NO AUTOMATIC TRADING",
+            "PROPOSED BUY/SELL candidates are separate from CONFIRMED BUY/SELL entries.",
+            "Proposed entry reference = zone midpoint; confirmed entry reference = completed M15 close.",
+            f"Account {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE:,.2f} | risk {RISK_PERCENT:.2f}% | budget {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE*RISK_PERCENT/100:.2f}",
+            "TP1=1R | TP2=2R | TP3=3R | exact broker specs required for lot sizing.",""]
+    for r in results:
+        report.append(f"{r['symbol']} â SCAN ERROR\n{r['error']}" if "error" in r else format_result(r));report.append("------------------------")
+    report.append("Confirmation requires H1/M15 alignment, matching M15 BOS/CHOCH, zone retest and rejection, plus a matching fresh sweep. Proposed ideas are not confirmed trades. No automatic orders are placed.")
+    send_long("\n".join(report))
+    state,sha,persist=load_state();alerts,stored=prepare_alerts(results,state,persist);sent=[]
     for item in alerts:
-        try:
-            send_long_message(item["message"])
-            successfully_sent.append(item["signature"])
-            print(f"Entry alert sent: {item['signature']}")
-        except Exception as error:
-            print(f"Entry alert failed: {error}")
+        try:send_long(item["message"]);sent.append(item["signature"]);print("Alert sent:",item["signature"])
+        except Exception as e:print("Alert failed:",e)
+    if persist and sent:
+        stamp=datetime.now(timezone.utc).isoformat()
+        for sig in sent:stored[sig]=stamp
+        state["alerts"]=dict(sorted(stored.items(),key=lambda x:x[1],reverse=True)[:200]);save_state(state,sha)
+    print(VERSION,"scan completed.")
 
-    if persistence_available and successfully_sent:
-        now_text = datetime.now(timezone.utc).isoformat()
-        for signature in successfully_sent:
-            stored[signature] = now_text
-        ordered = sorted(stored.items(), key=lambda item: item[1], reverse=True)
-        state["alerts"] = dict(ordered[:MAX_STORED_ALERTS])
-        save_alert_state(state, sha)
-    elif not persistence_available:
-        print("Persistent duplicate protection unavailable. Entry alerts may repeat on later scans.")
-
-    print(f"{VERSION} scan completed.")
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":main()

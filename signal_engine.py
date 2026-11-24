@@ -1,15 +1,14 @@
 import os, time, json, base64, math, requests
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from statistics import median
 
-VERSION = "V13.2"
+VERSION = "V13"
 API_KEY = os.getenv("TWELVE_DATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
 BOT_TOKEN, CHAT_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
 GH_TOKEN, REPO = os.getenv("GH_ALERT_TOKEN"), os.getenv("GITHUB_REPOSITORY")
 STATE_FILE = ".odj_alert_state.json"
 BASE_URL = "https://api.twelvedata.com/time_series"
-SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "XAU/USD"]
+SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
 FRAMES = {"H1": ("1h", 60, 180), "M15": ("15min", 15, 45)}
 OUTPUTSIZE, REQUEST_DELAY = 120, 8
 MAX_ZONE_AGE, MAX_ZONE_DISTANCE_ATR, MIN_ZONE_QUALITY = 32, 3.0, 35
@@ -17,18 +16,12 @@ MAX_SWEEP_AGE, LIQUIDITY_ATR = 4, 3.0
 STOP_BUFFER_ATR, MIN_STOP_ATR, MAX_STOP_ATR = .25, .15, 2.5
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "5000"))
 ACCOUNT_CURRENCY = os.getenv("ACCOUNT_CURRENCY", "USD").strip().upper()
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.75"))
-MAX_DAILY_LOSS_PERCENT = 0.5
-MAX_SIGNALS_PER_DAY = 5
-MANUAL_DAILY_LOSS_USD = float(os.getenv("MANUAL_DAILY_LOSS_USD", "0"))
-LAGOS = ZoneInfo("Africa/Lagos")
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
 TP_R = (1.0, 2.0, 3.0)
 BROKER = {
  "EUR/USD": (os.getenv("CONTRACT_SIZE_EURUSD"), os.getenv("MIN_LOT_EURUSD"), os.getenv("LOT_STEP_EURUSD"), os.getenv("MAX_LOT_EURUSD")),
  "GBP/USD": (os.getenv("CONTRACT_SIZE_GBPUSD"), os.getenv("MIN_LOT_GBPUSD"), os.getenv("LOT_STEP_GBPUSD"), os.getenv("MAX_LOT_GBPUSD")),
  "USD/JPY": (os.getenv("CONTRACT_SIZE_USDJPY"), os.getenv("MIN_LOT_USDJPY"), os.getenv("LOT_STEP_USDJPY"), os.getenv("MAX_LOT_USDJPY")),
- "AUD/USD": (os.getenv("CONTRACT_SIZE_AUDUSD"), os.getenv("MIN_LOT_AUDUSD"), os.getenv("LOT_STEP_AUDUSD"), os.getenv("MAX_LOT_AUDUSD")),
- "USD/CAD": (os.getenv("CONTRACT_SIZE_USDCAD"), os.getenv("MIN_LOT_USDCAD"), os.getenv("LOT_STEP_USDCAD"), os.getenv("MAX_LOT_USDCAD")),
  "XAU/USD": (os.getenv("CONTRACT_SIZE_XAUUSD"), os.getenv("MIN_LOT_XAUUSD"), os.getenv("LOT_STEP_XAUUSD"), os.getenv("MAX_LOT_XAUUSD")),
 }
 
@@ -81,28 +74,24 @@ def trend(hi,lo):
     return "RANGING"
 
 def structure(candles):
-    hi,lo=swings(candles)
-    out={"direction":trend(hi,lo),"bos":"NONE","choch":"NONE","range_break":"NONE","event_index":None,"event_level":None,"event_age":None,"highs":hi,"lows":lo}
-    # At each historical bar, use only pivots that were confirmed before that bar.
+    hi,lo=swings(candles); direction=trend(hi,lo)
+    out={"direction":direction,"bos":"NONE","choch":"NONE","range_break":"NONE","event_index":None,"event_level":None,"event_age":None,"highs":hi,"lows":lo}
+    # Recent close breaks are tested against the latest confirmed pivot, not
+    # the most extreme pivot in the entire history.
     for i in range(max(2,len(candles)-34),len(candles)):
-        ph=[x for x in hi if x["index"]+2 < i]
-        pl=[x for x in lo if x["index"]+2 < i]
+        ph=[x for x in hi if x["index"]<i]; pl=[x for x in lo if x["index"]<i]
         if not ph or not pl:continue
-        upper,lower=ph[-1]["price"],pl[-1]["price"]
-        prior_hi=[x for x in hi if x["index"]+2 < i]
-        prior_lo=[x for x in lo if x["index"]+2 < i]
-        local_trend=trend(prior_hi,prior_lo)
-        prev,close=candles[i-1]["close"],candles[i]["close"]
+        upper,lower=ph[-1]["price"],pl[-1]["price"]; prev,close=candles[i-1]["close"],candles[i]["close"]
         if prev<=upper and close>upper:
-            out.update(event_index=i,event_level=upper,event_age=len(candles)-1-i,bos="NONE",choch="NONE",range_break="NONE")
-            if local_trend=="BEARISH":out["choch"]="BULLISH"
-            elif local_trend=="RANGING":out["range_break"]="BULLISH"
-            else:out["bos"]="BULLISH"
+            out.update(event_index=i,event_level=upper,event_age=len(candles)-1-i)
+            if direction=="BEARISH":out.update(choch="BULLISH")
+            elif direction=="RANGING":out.update(range_break="BULLISH")
+            else:out.update(bos="BULLISH")
         elif prev>=lower and close<lower:
-            out.update(event_index=i,event_level=lower,event_age=len(candles)-1-i,bos="NONE",choch="NONE",range_break="NONE")
-            if local_trend=="BULLISH":out["choch"]="BEARISH"
-            elif local_trend=="RANGING":out["range_break"]="BEARISH"
-            else:out["bos"]="BEARISH"
+            out.update(event_index=i,event_level=lower,event_age=len(candles)-1-i)
+            if direction=="BULLISH":out.update(choch="BEARISH")
+            elif direction=="RANGING":out.update(range_break="BEARISH")
+            else:out.update(bos="BEARISH")
     return out
 
 def structure_event(s):
@@ -202,10 +191,7 @@ def liquidity(candles,a):
     return bn,bf,sn,sf
 
 def position_size(symbol,entry,stop):
-    daily_limit=ACCOUNT_BALANCE*MAX_DAILY_LOSS_PERCENT/100
-    remaining_daily_budget=max(0.0,daily_limit-MANUAL_DAILY_LOSS_USD)
-    requested_trade_risk=ACCOUNT_BALANCE*RISK_PERCENT/100
-    budget=min(requested_trade_risk,remaining_daily_budget)
+    budget=ACCOUNT_BALANCE*RISK_PERCENT/100
     def no(reason):return {"available":False,"lots":None,"reason":reason,"risk_amount":budget}
     if ACCOUNT_CURRENCY!="USD":return no("Only USD accounts are supported by this calculator.")
     specs=BROKER.get(symbol,())
@@ -277,7 +263,7 @@ def plan_message(r,confirmed):
            f"Entry reference: {fmt(p['entry'],s)}",f"Stop Loss: {fmt(p['stop'],s)}",
            f"TP1: {fmt(p['tp1'],s)} (1R)",f"TP2: {fmt(p['tp2'],s)} (2R)",f"TP3: {fmt(p['tp3'],s)} (3R)",
            f"Stop distance: {fmt(p['risk'],s)} | {p['risk_atr']:.2f} ATR",
-           f"Account: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE:,.2f} | requested risk: {RISK_PERCENT:.2f}% ({ACCOUNT_CURRENCY} {ACCOUNT_BALANCE*RISK_PERCENT/100:.2f}) | capped trade budget: {ACCOUNT_CURRENCY} {sizing['risk_amount']:.2f}"]
+           f"Account: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE:,.2f} | risk budget: {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE*RISK_PERCENT/100:.2f} ({RISK_PERCENT:.2f}%)"]
     if sizing["available"]:lines.append(f"Risk-sized lot: {sizing['lots']:.8f} | estimated risk: {ACCOUNT_CURRENCY} {sizing['estimated_risk']:.2f} | {sizing['conversion_note']}")
     else:lines.append("LOT SIZE NOT AVAILABLE: "+sizing["reason"])
     lines += [f"H1 {r['h1']['direction']} | M15 {r['m15']['direction']}",f"Zone: {z['type']} {z['direction']} {fmt(z['low'],s)}â{fmt(z['high'],s)} | quality {z['quality']}/100",
@@ -355,37 +341,22 @@ def alert_signature(r,kind):
     return "|".join([kind,s,z["direction"],z["type"],str(round(z["low"],digits)),str(round(z["high"],digits))])
 
 def prepare_alerts(results,state,persist):
-    if not persist:
-        raise RuntimeError("Persistent GitHub alert state is required for the daily five-signal cap. Configure GH_ALERT_TOKEN with repository Contents read/write access.")
-    today=datetime.now(LAGOS).date().isoformat()
-    daily=state.get("daily",{}) if isinstance(state.get("daily",{}),dict) else {}
-    if daily.get("date") != today:
-        daily={"date":today,"signals_sent":0}
-    used=int(daily.get("signals_sent",0))
     cutoff=datetime.now(timezone.utc)-timedelta(days=30);stored={}
     for sig,stamp in state.get("alerts",{}).items():
         t=parse_time(stamp)
         if t and t>=cutoff:stored[sig]=stamp
     alerts=[]
-    daily_loss_limit=ACCOUNT_BALANCE*MAX_DAILY_LOSS_PERCENT/100
-    if MANUAL_DAILY_LOSS_USD < 0 or not math.isfinite(MANUAL_DAILY_LOSS_USD):
-        raise RuntimeError("MANUAL_DAILY_LOSS_USD must be a non-negative loss amount in USD.")
-    if MANUAL_DAILY_LOSS_USD >= daily_loss_limit:
-        state["daily"]={"date":today,"signals_sent":used,"loss_lock":True}
-        return [],stored,state,"DAILY LOSS LOCK: manual reported loss has reached the 0.5% daily limit. No signal alerts will be sent."
     for r in results:
         if "error" in r or not r.get("levels"):continue
         kind="CONFIRMED" if r["entry_valid"] else "PROPOSED";sig=alert_signature(r,kind)
-        if sig in stored:continue
-        if used+len(alerts)>=MAX_SIGNALS_PER_DAY:break
+        if persist and sig in stored:continue
         alerts.append({"signature":sig,"message":plan_message(r,r["entry_valid"])})
-    return alerts,stored,state,None
+    return alerts,stored
 
 def main():
     if not API_KEY:raise RuntimeError("Twelve Data API key missing")
     if not BOT_TOKEN or not CHAT_ID:raise RuntimeError("Telegram credentials missing")
-    if not math.isfinite(ACCOUNT_BALANCE) or ACCOUNT_BALANCE<=0 or RISK_PERCENT != 0.75:raise RuntimeError("Account balance must be positive and per-trade risk must remain 0.75%.")
-    if not math.isfinite(MANUAL_DAILY_LOSS_USD) or MANUAL_DAILY_LOSS_USD<0:raise RuntimeError("MANUAL_DAILY_LOSS_USD must be non-negative.")
+    if not math.isfinite(ACCOUNT_BALANCE) or ACCOUNT_BALANCE<=0 or not 0<RISK_PERCENT<=100:raise RuntimeError("Check account balance and risk percentage.")
     scan=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC");results=[]
     for symbol in SYMBOLS:
         try:
@@ -394,32 +365,21 @@ def main():
             r=evaluate(symbol,h1,m15,hm,mm);results.append(r);print(symbol,r["status"],"score",r["entry_score"])
         except Exception as e:print("ERROR",symbol,e);results.append({"symbol":symbol,"error":str(e)})
     report=[f"ð¤ ODJ AI SMART TRADER {VERSION}",f"Scan: {scan}","ALERT ONLY â NO AUTOMATIC TRADING",
-            "Daily loss lock depends on MANUAL_DAILY_LOSS_USD being updated with your Exness realised daily loss; it cannot read manual trades.",
             "PROPOSED BUY/SELL candidates are separate from CONFIRMED BUY/SELL entries.",
             "Proposed entry reference = zone midpoint; confirmed entry reference = completed M15 close.",
             f"Account {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE:,.2f} | risk {RISK_PERCENT:.2f}% | budget {ACCOUNT_CURRENCY} {ACCOUNT_BALANCE*RISK_PERCENT/100:.2f}",
-            f"Daily loss ceiling: USD {ACCOUNT_BALANCE*MAX_DAILY_LOSS_PERCENT/100:.2f} (0.5%). Manual realised loss input: USD {MANUAL_DAILY_LOSS_USD:.2f}.",
-            f"Per-trade risk target: {RISK_PERCENT:.2f}% (USD {ACCOUNT_BALANCE*RISK_PERCENT/100:.2f}); actual position risk is capped by remaining daily loss budget (USD {max(0.0,ACCOUNT_BALANCE*MAX_DAILY_LOSS_PERCENT/100-MANUAL_DAILY_LOSS_USD):.2f}).",
-            f"Maximum {MAX_SIGNALS_PER_DAY} proposed/confirmed alerts per Lagos calendar day. Minimum target: 2R (TP2).",
-            "Minimum target is TP2=2R (TP1=1R is optional partial target); exact broker specs required for lot sizing.",""]
+            "TP1=1R | TP2=2R | TP3=3R | exact broker specs required for lot sizing.",""]
     for r in results:
         report.append(f"{r['symbol']} â SCAN ERROR\n{r['error']}" if "error" in r else format_result(r));report.append("------------------------")
     report.append("Confirmation requires H1/M15 alignment, matching M15 BOS/CHOCH, zone retest and rejection, plus a matching fresh sweep. Proposed ideas are not confirmed trades. No automatic orders are placed.")
     send_long("\n".join(report))
-    state,sha,persist=load_state();alerts,stored,state,lock_message=prepare_alerts(results,state,persist);sent=[]
-    if lock_message:send_long(lock_message)
+    state,sha,persist=load_state();alerts,stored=prepare_alerts(results,state,persist);sent=[]
     for item in alerts:
         try:send_long(item["message"]);sent.append(item["signature"]);print("Alert sent:",item["signature"])
         except Exception as e:print("Alert failed:",e)
-    if persist:
+    if persist and sent:
         stamp=datetime.now(timezone.utc).isoformat()
         for sig in sent:stored[sig]=stamp
-        today=datetime.now(LAGOS).date().isoformat()
-        daily=state.get("daily",{}) if isinstance(state.get("daily",{}),dict) else {}
-        if daily.get("date") != today:daily={"date":today,"signals_sent":0}
-        daily["signals_sent"]=int(daily.get("signals_sent",0))+len(sent)
-        daily["loss_lock"]=bool(lock_message)
-        state["daily"]=daily
         state["alerts"]=dict(sorted(stored.items(),key=lambda x:x[1],reverse=True)[:200]);save_state(state,sha)
     print(VERSION,"scan completed.")
 
